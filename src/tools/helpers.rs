@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::str::FromStr;
 use twilight_model::id::{
-    marker::{ChannelMarker, GuildMarker},
+    marker::{ChannelMarker, GuildMarker, RoleMarker, UserMarker},
     Id,
 };
 
@@ -12,6 +12,29 @@ pub fn parse_channel_id(args: &Value, field: &str) -> Result<Id<ChannelMarker>, 
         return Err(format!("Missing required field '{field}'."));
     }
     Id::<ChannelMarker>::from_str(raw).map_err(|_| format!("Invalid channel ID '{raw}'."))
+}
+
+pub fn parse_user_id(args: &Value, field: &str) -> Result<Id<UserMarker>, String> {
+    let raw = args[field].as_str().unwrap_or_default().trim();
+    if raw.is_empty() {
+        return Err(format!("Missing required field '{field}'."));
+    }
+    // Accept raw snowflakes and `<@123>` / `<@!123>` mentions.
+    let digits = raw
+        .trim_start_matches("<@")
+        .trim_start_matches('!')
+        .trim_end_matches('>');
+    Id::<UserMarker>::from_str(digits).map_err(|_| format!("Invalid user ID '{raw}'."))
+}
+
+pub fn parse_role_id(args: &Value, field: &str) -> Result<Id<RoleMarker>, String> {
+    let raw = args[field].as_str().unwrap_or_default().trim();
+    if raw.is_empty() {
+        return Err(format!("Missing required field '{field}'."));
+    }
+    // Accept raw snowflakes and `<@&123>` role mentions.
+    let digits = raw.trim_start_matches("<@&").trim_end_matches('>');
+    Id::<RoleMarker>::from_str(digits).map_err(|_| format!("Invalid role ID '{raw}'."))
 }
 
 pub fn parse_guild_id(args: &Value, field: &str) -> Result<Id<GuildMarker>, String> {
@@ -51,5 +74,14 @@ mod tests {
         assert_eq!(clamp_purge_count(&json!({})), 10);
         assert_eq!(clamp_purge_count(&json!({"count": 0})), 1);
         assert_eq!(clamp_purge_count(&json!({"count": 500})), 100);
+    }
+
+    #[test]
+    fn accepts_mentions_for_user_and_role() {
+        assert!(parse_user_id(&json!({"user_id": "<@123456789012345678>"}), "user_id").is_ok());
+        assert!(parse_user_id(&json!({"user_id": "<@!123456789012345678>"}), "user_id").is_ok());
+        assert!(parse_role_id(&json!({"role_id": "<@&123456789012345678>"}), "role_id").is_ok());
+        assert!(parse_user_id(&json!({"user_id": "not-an-id"}), "user_id").is_err());
+        assert!(parse_role_id(&json!({}), "role_id").is_err());
     }
 }

@@ -22,14 +22,52 @@ fn tools_declaration_shape_matches_gemini_api() {
 
 #[test]
 fn registry_lists_expected_tools() {
-    for name in ["create_role", "rename_channel", "purge_messages"] {
-        assert!(tools::tool_names().contains(&name));
+    for name in [
+        "list_channels",
+        "user_info",
+        "kick_member",
+        "ban_member",
+        "unban_user",
+        "timeout_member",
+        "purge_messages",
+        "create_channel",
+        "rename_channel",
+        "delete_channel",
+        "set_slowmode",
+        "create_role",
+        "assign_role",
+        "remove_role",
+    ] {
+        assert!(tools::tool_names().contains(&name), "missing {name}");
+    }
+    // No duplicates.
+    let mut seen = std::collections::HashSet::new();
+    for name in tools::tool_names() {
+        assert!(seen.insert(name), "duplicate tool {name}");
     }
 }
 
 #[test]
 fn destructive_flags_are_sane() {
-    assert!(tools::is_destructive("purge_messages"));
-    assert!(!tools::is_destructive("create_role"));
-    assert!(!tools::is_destructive("rename_channel"));
+    for name in [
+        "kick_member",
+        "ban_member",
+        "timeout_member",
+        "purge_messages",
+        "delete_channel",
+    ] {
+        assert!(tools::is_destructive(name), "{name} should be destructive");
+    }
+    for name in [
+        "list_channels",
+        "user_info",
+        "create_role",
+        "rename_channel",
+        "set_slowmode",
+    ] {
+        assert!(
+            !tools::is_destructive(name),
+            "{name} should not be destructive"
+        );
+    }
 }
