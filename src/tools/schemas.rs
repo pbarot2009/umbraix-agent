@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-use super::{channels, info, moderation, roles};
+use super::{channels, extra, info, moderation, roles};
 
 /// Tools declaration using Gemini's native function calling schema.
 ///
@@ -13,21 +13,32 @@ pub fn build_tools_declaration() -> Value {
             // Read-only grounding (list first so the model discovers them).
             info::list_channels_schema(),
             info::user_info_schema(),
+            extra::list_roles_schema(),
+            extra::search_members_schema(),
+            extra::server_info_schema(),
+            extra::list_bans_schema(),
+            extra::get_messages_schema(),
+            // Messaging.
+            extra::send_message_schema(),
             // Moderation.
             moderation::kick_schema(),
             moderation::ban_schema(),
             moderation::unban_schema(),
             moderation::timeout_schema(),
+            extra::remove_timeout_schema(),
             moderation::purge_schema(),
+            extra::set_nickname_schema(),
             // Channels.
             channels::create_schema(),
             channels::rename_schema(),
             channels::delete_schema(),
             channels::slowmode_schema(),
+            extra::set_topic_schema(),
             // Roles.
             roles::create_schema(),
             roles::assign_schema(),
             roles::remove_schema(),
+            extra::delete_role_schema(),
         ]
     }])
 }
@@ -37,18 +48,28 @@ pub fn tool_names() -> &'static [&'static str] {
     &[
         "list_channels",
         "user_info",
+        "list_roles",
+        "search_members",
+        "server_info",
+        "list_bans",
+        "get_messages",
+        "send_message",
         "kick_member",
         "ban_member",
         "unban_user",
         "timeout_member",
+        "remove_timeout",
         "purge_messages",
+        "set_nickname",
         "create_channel",
         "rename_channel",
         "delete_channel",
         "set_slowmode",
+        "set_topic",
         "create_role",
         "assign_role",
         "remove_role",
+        "delete_role",
     ]
 }
 
@@ -59,7 +80,13 @@ pub fn tool_names() -> &'static [&'static str] {
 pub fn is_destructive(name: &str) -> bool {
     matches!(
         name,
-        "kick_member" | "ban_member" | "timeout_member" | "purge_messages" | "delete_channel"
+        "kick_member"
+            | "ban_member"
+            | "unban_user"
+            | "timeout_member"
+            | "purge_messages"
+            | "delete_channel"
+            | "delete_role"
     )
 }
 

@@ -25,18 +25,28 @@ fn registry_lists_expected_tools() {
     for name in [
         "list_channels",
         "user_info",
+        "list_roles",
+        "search_members",
+        "server_info",
+        "list_bans",
+        "get_messages",
+        "send_message",
         "kick_member",
         "ban_member",
         "unban_user",
         "timeout_member",
+        "remove_timeout",
         "purge_messages",
+        "set_nickname",
         "create_channel",
         "rename_channel",
         "delete_channel",
         "set_slowmode",
+        "set_topic",
         "create_role",
         "assign_role",
         "remove_role",
+        "delete_role",
     ] {
         assert!(tools::tool_names().contains(&name), "missing {name}");
     }
@@ -52,18 +62,32 @@ fn destructive_flags_are_sane() {
     for name in [
         "kick_member",
         "ban_member",
+        "unban_user",
         "timeout_member",
         "purge_messages",
         "delete_channel",
+        "delete_role",
     ] {
         assert!(tools::is_destructive(name), "{name} should be destructive");
     }
     for name in [
         "list_channels",
         "user_info",
+        "list_roles",
+        "search_members",
+        "server_info",
+        "list_bans",
+        "get_messages",
+        "send_message",
+        "set_nickname",
+        "remove_timeout",
         "create_role",
+        "assign_role",
+        "remove_role",
         "rename_channel",
         "set_slowmode",
+        "set_topic",
+        "create_channel",
     ] {
         assert!(
             !tools::is_destructive(name),

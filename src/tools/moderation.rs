@@ -10,7 +10,7 @@ use twilight_model::{
     util::Timestamp,
 };
 
-use super::helpers::{clamp_purge_count, get_str, parse_channel_id, parse_user_id};
+use super::helpers::{clamp_int_arg, clamp_purge_count, get_str, parse_channel_id, parse_user_id};
 
 /// JSON schema advertised to Gemini for `purge_messages`.
 pub fn purge_schema() -> Value {
@@ -141,10 +141,38 @@ pub async fn purge(
     let message_ids: Vec<Id<MessageMarker>> = messages.into_iter().map(|m| m.id).collect();
     let total = message_ids.len();
 
+    if total == 0 {
+        return Ok(format!("No messages to purge in <#{channel_id}>"));
+    }
     if total == 1 {
         discord.delete_message(channel_id, message_ids[0]).await?;
-    } else if total > 1 {
-        discord.delete_messages(channel_id, &message_ids).await?;
+    } else {
+        // Bulk delete rejects messages older than 14 days with a single
+        // error; fall back to individual deletes so one old message doesn't
+        // fail the whole purge.
+        if let Err(e) = discord.delete_messages(channel_id, &message_ids).await {
+            tracing::warn!(?e, "Bulk delete failed, falling back to single deletes");
+            let mut deleted = 0usize;
+            let mut failed = 0usize;
+            for id in &message_ids {
+                match discord.delete_message(channel_id, *id).await {
+                    Ok(_) => deleted += 1,
+                    Err(e) => {
+                        tracing::warn!(?e, message_id = %id, "Single delete failed");
+                        failed += 1;
+                    }
+                }
+            }
+            if deleted == 0 {
+                return Err(format!(
+                    "purge_messages: bulk delete failed ({e}) and all {failed} single deletes failed (messages may be older than 14 days or missing permissions)"
+                )
+                .into());
+            }
+            return Ok(format!(
+                "Purged {deleted} messages in <#{channel_id}> ({failed} failed — likely older than 14 days)"
+            ));
+        }
     }
 
     Ok(format!(
@@ -177,10 +205,7 @@ pub async fn ban(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let user_id = parse_user_id(args, "user_id").map_err(|e| format!("ban_member: {e}"))?;
     let reason = get_str(args, "reason", "");
-    let delete_days = args["delete_message_days"]
-        .as_u64()
-        .unwrap_or(0)
-        .clamp(0, 7);
+    let delete_days = clamp_int_arg(args, "delete_message_days", 0, 0, 7);
 
     let mut request = discord
         .create_ban(guild_id, user_id)
@@ -211,7 +236,7 @@ pub async fn timeout(
     discord: &DiscordHttp,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let user_id = parse_user_id(args, "user_id").map_err(|e| format!("timeout_member: {e}"))?;
-    let minutes = args["minutes"].as_u64().unwrap_or(10).clamp(1, 40_320);
+    let minutes = clamp_int_arg(args, "minutes", 10, 1, 40_320);
     let reason = get_str(args, "reason", "");
 
     let now = SystemTime::now()

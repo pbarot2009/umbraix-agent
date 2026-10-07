@@ -11,16 +11,24 @@ use tokio::sync::Mutex;
 /// they can be replayed verbatim in the next `generateContent` call.
 /// Bounded by `limit` entries per channel (each user/model round-trip counts
 /// as two entries).
+///
+/// `MAX_CHANNELS` bounds the number of tracked channels so a bot sitting in
+/// many channels cannot grow memory without bound; the oldest-touched
+/// channel is evicted first (approximate LRU via insertion order refresh).
 #[derive(Debug, Clone)]
 pub struct ConversationMemory {
     inner: Arc<Mutex<HashMap<u64, VecDeque<Value>>>>,
+    touched: Arc<Mutex<VecDeque<u64>>>,
     limit: usize,
 }
+
+const MAX_CHANNELS: usize = 500;
 
 impl ConversationMemory {
     pub fn new(limit: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            touched: Arc::new(Mutex::new(VecDeque::new())),
             limit,
         }
     }
@@ -43,9 +51,47 @@ impl ConversationMemory {
         if self.limit == 0 || new_entries.is_empty() {
             return;
         }
+        // Cap a single turn's contribution so one huge 100-step trajectory
+        // cannot wipe the whole retained history; keep the tail (most recent
+        // grounding) plus the original user request.
+        let mut entries = new_entries;
+        if entries.len() > self.limit {
+            let mut capped = Vec::with_capacity(self.limit);
+            capped.push(entries.remove(0));
+            let tail = self.limit - 1;
+            capped.extend(
+                entries
+                    .into_iter()
+                    .rev()
+                    .take(tail)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            );
+            entries = capped;
+        }
+        let mut guard = self.inner.lock().await;
+        // Evict oldest channel when over capacity (and not this channel).
+        if !guard.contains_key(&channel_id) && guard.len() >= MAX_CHANNELS {
+            let victim = {
+                let touched = self.touched.lock().await;
+                touched.iter().find(|id| **id != channel_id).copied()
+            };
+            if let Some(victim) = victim {
+                guard.remove(&victim);
+                let mut touched = self.touched.lock().await;
+                touched.retain(|id| *id != victim);
+            }
+        }
+        drop(guard);
+        {
+            let mut touched = self.touched.lock().await;
+            touched.retain(|id| *id != channel_id);
+            touched.push_back(channel_id);
+        }
         let mut guard = self.inner.lock().await;
         let queue = guard.entry(channel_id).or_insert_with(VecDeque::new);
-        for entry in new_entries {
+        for entry in entries {
             queue.push_back(entry);
             while queue.len() > self.limit {
                 queue.pop_front();
@@ -64,6 +110,7 @@ impl ConversationMemory {
 
     pub async fn clear(&self, channel_id: u64) {
         self.inner.lock().await.remove(&channel_id);
+        self.touched.lock().await.retain(|id| *id != channel_id);
     }
 }
 

@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use twilight_http::{request::AuditLogReason, Client as DiscordHttp};
 use twilight_model::id::{marker::GuildMarker, Id};
 
-use super::helpers::{get_str, parse_role_id, parse_user_id};
+use super::helpers::{clamp_int_arg, get_str, parse_role_id, parse_user_id};
 
 /// JSON schema advertised to Gemini for `create_role`.
 pub fn create_schema() -> Value {
@@ -81,16 +81,22 @@ pub async fn create(
     guild_id: Id<GuildMarker>,
     discord: &DiscordHttp,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let role_name = get_str(args, "name", "New Role");
-    let role_name = if role_name.is_empty() {
-        "New Role"
-    } else {
-        role_name
-    };
+    // Never invent a placeholder name: creating "New Role" junk on malformed
+    // args was a recurring real-world annoyance.
+    let role_name = get_str(args, "name", "");
+    if role_name.is_empty() {
+        return Err("create_role: 'name' is required and must not be empty.".into());
+    }
+    if role_name.len() > 100 {
+        return Err("create_role: 'name' must be at most 100 characters.".into());
+    }
 
     let mut builder = discord.create_role(guild_id).name(role_name);
 
-    if let Some(color) = args["color"].as_u64() {
+    // Only apply a color when the model actually passed one; accept both
+    // numbers and numeric strings.
+    if args.get("color").is_some() && !args["color"].is_null() {
+        let color = clamp_int_arg(args, "color", 0, 0, 0xFF_FF_FF);
         builder = builder.color(color as u32);
     }
 

@@ -34,6 +34,8 @@ mod tests {
             temperature: 0.2,
             history_limit: 20,
             rate_limit_secs: 3,
+            turn_timeout_secs: 300,
+            max_tool_output_chars: 4000,
         }
     }
 

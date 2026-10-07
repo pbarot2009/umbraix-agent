@@ -5,7 +5,7 @@ use twilight_model::{
     id::{marker::GuildMarker, Id},
 };
 
-use super::helpers::{get_str, parse_channel_id};
+use super::helpers::{clamp_int_arg, get_str, parse_channel_id};
 
 fn channel_kind_label(kind: ChannelType) -> &'static str {
     match kind {
@@ -109,9 +109,14 @@ pub async fn rename(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let channel_id =
         parse_channel_id(args, "channel_id").map_err(|e| format!("rename_channel: {e}"))?;
-    let new_name = get_str(args, "new_name", "channel");
+    // Never fall back to a placeholder name: a missing arg must fail loudly
+    // instead of renaming a channel to "channel".
+    let new_name = get_str(args, "new_name", "");
     if new_name.is_empty() {
-        return Err("rename_channel: 'new_name' must not be empty.".into());
+        return Err("rename_channel: 'new_name' is required and must not be empty.".into());
+    }
+    if new_name.len() > 100 {
+        return Err("rename_channel: 'new_name' must be at most 100 characters.".into());
     }
 
     discord.update_channel(channel_id).name(new_name).await?;
@@ -128,7 +133,10 @@ pub async fn create(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let name = get_str(args, "name", "");
     if name.is_empty() {
-        return Err("create_channel: 'name' must not be empty.".into());
+        return Err("create_channel: 'name' is required and must not be empty.".into());
+    }
+    if name.len() > 100 {
+        return Err("create_channel: 'name' must be at most 100 characters.".into());
     }
     let kind = match get_str(args, "kind", "text").to_lowercase().as_str() {
         "voice" => ChannelType::GuildVoice,
@@ -139,7 +147,11 @@ pub async fn create(
     let topic = get_str(args, "topic", "");
 
     let mut request = discord.create_guild_channel(guild_id, name).kind(kind);
-    if !topic.is_empty() && kind == ChannelType::GuildText {
+    // Topics are valid on text AND announcement channels; silently dropping
+    // them for announcements wasted a step and confused the model.
+    if !topic.is_empty()
+        && (kind == ChannelType::GuildText || kind == ChannelType::GuildAnnouncement)
+    {
         request = request.topic(topic);
     }
     let channel = request.await?.model().await?;
@@ -172,7 +184,7 @@ pub async fn slowmode(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let channel_id =
         parse_channel_id(args, "channel_id").map_err(|e| format!("set_slowmode: {e}"))?;
-    let seconds = args["seconds"].as_u64().unwrap_or(0).clamp(0, 21_600) as u16;
+    let seconds = clamp_int_arg(args, "seconds", 0, 0, 21_600) as u16;
 
     discord
         .update_channel(channel_id)

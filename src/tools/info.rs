@@ -47,13 +47,28 @@ pub async fn list_channels(
         return Ok("The server has no channels.".to_string());
     }
 
+    fn kind_label(kind: twilight_model::channel::ChannelType) -> &'static str {
+        use twilight_model::channel::ChannelType as T;
+        match kind {
+            T::GuildText => "text",
+            T::GuildVoice => "voice",
+            T::GuildAnnouncement => "announcement",
+            T::GuildCategory => "category",
+            T::GuildStageVoice => "stage",
+            T::GuildForum => "forum",
+            T::AnnouncementThread | T::PublicThread | T::PrivateThread => "thread",
+            _ => "other",
+        }
+    }
+
     // Cap output so a huge server doesn't blow up the model's context.
     let mut lines = Vec::new();
     for channel in channels.iter().take(50) {
         let name = channel.name.as_deref().unwrap_or("(no name)");
         lines.push(format!(
-            "- #{name} id={} kind={:?}",
-            channel.id, channel.kind
+            "- #{name} id={} kind={}",
+            channel.id,
+            kind_label(channel.kind)
         ));
     }
     let mut out = format!("Channels in server {guild_id}:\n{}", lines.join("\n"));
@@ -85,9 +100,14 @@ pub async fn user_info(
         .joined_at
         .map(|t| t.iso_8601().to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    let nick = member.nick.as_deref().unwrap_or("(no nickname)");
+    let timed_out = member
+        .communication_disabled_until
+        .map(|t| t.iso_8601().to_string())
+        .unwrap_or_else(|| "no".to_string());
 
     Ok(format!(
-        "User {} (bot: {}): {} role(s) [{}], joined {}",
+        "User {} (id={user_id}, nick='{nick}', bot: {}): {} role(s) [{}], joined {}, timed out until: {timed_out}",
         member.user.name,
         member.user.bot,
         member.roles.len(),
