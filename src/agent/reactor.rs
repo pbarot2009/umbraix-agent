@@ -239,9 +239,11 @@ async fn run_inner(
         new_entries.push(tool_msg);
 
         // Bound the in-turn context. Drop whole (call, response) pairs right
-        // after this turn's user prompt so pairs never get split.
-        if contents.len() > 90 {
-            let excess = (contents.len() - 80) & !1;
+        // after this turn's user prompt so pairs never get split. The window
+        // scales for large budgets (up to 256 steps) so long server builds
+        // keep working without blowing the model's context.
+        if contents.len() > 260 {
+            let excess = (contents.len() - 240) & !1;
             let end = (turn_start + excess).min(contents.len().saturating_sub(2));
             if end > turn_start {
                 contents.drain(turn_start..end);

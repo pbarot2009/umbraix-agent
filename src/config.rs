@@ -105,11 +105,11 @@ impl Config {
             database_url: non_empty_or("DATABASE_URL", "sqlite://data/umbraix.db"),
             command_prefix,
             gemini_model: non_empty_or("GEMINI_MODEL", "gemini-flash-lite-latest"),
-            max_iterations: parsed("MAX_ITERATIONS", 10usize).clamp(1, 100),
+            max_iterations: parsed("MAX_ITERATIONS", 25usize).clamp(1, 256),
             temperature: parsed("AGENT_TEMPERATURE", 0.2f32).clamp(0.0, 2.0),
             history_limit: parsed("HISTORY_LIMIT", 20usize).clamp(0, 100),
             rate_limit_secs: parsed("RATE_LIMIT_SECS", 3u64).clamp(1, 3600),
-            turn_timeout_secs: parsed("TURN_TIMEOUT_SECS", 300u64).clamp(30, 1800),
+            turn_timeout_secs: parsed("TURN_TIMEOUT_SECS", 600u64).clamp(30, 1800),
             max_tool_output_chars: parsed("MAX_TOOL_OUTPUT_CHARS", 4000usize).clamp(500, 20_000),
             max_concurrent_turns: parsed("MAX_CONCURRENT_TURNS", 128usize).clamp(1, 2048),
             max_concurrent_per_key: parsed("MAX_CONCURRENT_PER_KEY", 8usize).clamp(1, 128),
@@ -189,8 +189,8 @@ mod tests {
             let cfg = Config::from_env().unwrap();
             assert_eq!(cfg.owner_id, 123);
             assert_eq!(cfg.gemini_model, "gemini-flash-lite-latest");
-            assert_eq!(cfg.max_iterations, 10);
-            assert_eq!(cfg.turn_timeout_secs, 300);
+            assert_eq!(cfg.max_iterations, 25);
+            assert_eq!(cfg.turn_timeout_secs, 600);
             assert_eq!(cfg.max_tool_output_chars, 4000);
             assert_eq!(cfg.max_concurrent_turns, 128);
             assert_eq!(cfg.command_prefix, "!");
@@ -201,14 +201,14 @@ mod tests {
     #[test]
     fn max_iterations_is_clamped() {
         with_env(&[("MAX_ITERATIONS", "999")], || {
-            assert_eq!(Config::from_env().unwrap().max_iterations, 100);
+            assert_eq!(Config::from_env().unwrap().max_iterations, 256);
         });
     }
 
     #[test]
     fn max_iterations_allows_real_world_budgets() {
-        with_env(&[("MAX_ITERATIONS", "60")], || {
-            assert_eq!(Config::from_env().unwrap().max_iterations, 60);
+        with_env(&[("MAX_ITERATIONS", "200")], || {
+            assert_eq!(Config::from_env().unwrap().max_iterations, 200);
         });
     }
 

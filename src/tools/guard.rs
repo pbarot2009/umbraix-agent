@@ -35,17 +35,53 @@ pub struct ToolGuard {
 pub fn required_permission(tool: &str) -> Option<Permissions> {
     Some(match tool {
         "list_bans" => Permissions::BAN_MEMBERS,
-        "get_messages" => Permissions::VIEW_CHANNEL | Permissions::READ_MESSAGE_HISTORY,
-        "send_message" => Permissions::VIEW_CHANNEL | Permissions::SEND_MESSAGES,
+        "get_messages" | "get_message_details" | "list_pins" => {
+            Permissions::VIEW_CHANNEL | Permissions::READ_MESSAGE_HISTORY
+        }
+        "channel_details" | "list_active_threads" | "list_thread_members" => {
+            Permissions::VIEW_CHANNEL
+        }
+        "list_channel_invites" => Permissions::MANAGE_CHANNELS | Permissions::VIEW_CHANNEL,
+        "send_message" | "publish_message" => {
+            Permissions::VIEW_CHANNEL | Permissions::SEND_MESSAGES
+        }
+        "edit_message" | "delete_single_message" => {
+            Permissions::VIEW_CHANNEL | Permissions::MANAGE_MESSAGES
+        }
+        "pin_message" | "unpin_message" => {
+            Permissions::VIEW_CHANNEL | Permissions::MANAGE_MESSAGES
+        }
         "kick_member" => Permissions::KICK_MEMBERS,
         "ban_member" | "unban_user" => Permissions::BAN_MEMBERS,
         "timeout_member" | "remove_timeout" => Permissions::MODERATE_MEMBERS,
         "purge_messages" => Permissions::MANAGE_MESSAGES,
         "set_nickname" => Permissions::MANAGE_NICKNAMES,
-        "create_channel" | "rename_channel" | "delete_channel" | "set_slowmode" | "set_topic" => {
-            Permissions::MANAGE_CHANNELS
+        "warn_member" => Permissions::MODERATE_MEMBERS,
+        "prune_members" | "prune_preview" => Permissions::KICK_MEMBERS,
+        "create_channel" | "rename_channel" | "delete_channel" | "set_slowmode"
+        | "set_topic" | "move_channel" | "clone_channel" | "set_channel_nsfw"
+        | "set_voice_limits" | "lock_channel" | "unlock_channel" | "set_channel_permissions"
+        | "clear_channel_permissions" => Permissions::MANAGE_CHANNELS,
+        "create_role" | "assign_role" | "remove_role" | "delete_role" | "edit_role"
+        | "set_role_color" | "set_role_permissions" | "set_role_position" => {
+            Permissions::MANAGE_ROLES
         }
-        "create_role" | "assign_role" | "remove_role" | "delete_role" => Permissions::MANAGE_ROLES,
+        "list_role_members" | "role_info" => Permissions::MANAGE_ROLES,
+        "move_voice_member" | "disconnect_voice_member" => Permissions::MOVE_MEMBERS,
+        "mute_voice_member" | "unmute_voice_member" => Permissions::MUTE_MEMBERS,
+        "deafen_voice_member" | "undeafen_voice_member" => Permissions::DEAFEN_MEMBERS,
+        "get_voice_state" => Permissions::VIEW_CHANNEL,
+        "create_thread" | "thread_from_message" | "join_thread" | "archive_thread"
+        | "add_thread_member" | "remove_thread_member" => {
+            Permissions::VIEW_CHANNEL | Permissions::SEND_MESSAGES
+        }
+        "create_invite" | "delete_invite" => Permissions::CREATE_INVITE,
+        "list_webhooks" | "create_webhook" | "delete_webhook" => Permissions::MANAGE_WEBHOOKS,
+        "list_emojis" | "rename_emoji" | "delete_emoji" => Permissions::MANAGE_GUILD_EXPRESSIONS,
+        "list_scheduled_events" | "delete_scheduled_event" => Permissions::MANAGE_EVENTS,
+        "list_automod_rules" => Permissions::MANAGE_GUILD,
+        "get_audit_logs" => Permissions::VIEW_AUDIT_LOG,
+        "edit_server" => Permissions::MANAGE_GUILD,
         _ => return None,
     })
 }
@@ -60,27 +96,63 @@ fn targets_member(tool: &str) -> bool {
             | "set_nickname"
             | "assign_role"
             | "remove_role"
+            | "warn_member"
+            | "move_voice_member"
+            | "disconnect_voice_member"
+            | "mute_voice_member"
+            | "unmute_voice_member"
+            | "deafen_voice_member"
+            | "undeafen_voice_member"
+            | "add_thread_member"
+            | "remove_thread_member"
     )
 }
 
 fn targets_role(tool: &str) -> bool {
-    matches!(tool, "assign_role" | "remove_role" | "delete_role")
+    matches!(
+        tool,
+        "assign_role"
+            | "remove_role"
+            | "delete_role"
+            | "edit_role"
+            | "set_role_color"
+            | "set_role_permissions"
+            | "set_role_position"
+    )
 }
 
 pub fn permission_label(p: Permissions) -> String {
     const NAMES: &[(Permissions, &str)] = &[
+        (Permissions::ADMINISTRATOR, "Administrator"),
+        (Permissions::MANAGE_GUILD, "Manage Server"),
+        (Permissions::MANAGE_CHANNELS, "Manage Channels"),
+        (Permissions::MANAGE_ROLES, "Manage Roles"),
+        (Permissions::MANAGE_GUILD_EXPRESSIONS, "Manage Emojis/Stickers"),
+        (Permissions::MANAGE_WEBHOOKS, "Manage Webhooks"),
+        (Permissions::MANAGE_EVENTS, "Manage Events"),
+        (Permissions::CREATE_EVENTS, "Create Events"),
+        (Permissions::CREATE_INVITE, "Create Invite"),
         (Permissions::BAN_MEMBERS, "Ban Members"),
         (Permissions::KICK_MEMBERS, "Kick Members"),
         (Permissions::MODERATE_MEMBERS, "Timeout Members"),
         (Permissions::MANAGE_MESSAGES, "Manage Messages"),
         (Permissions::MANAGE_NICKNAMES, "Manage Nicknames"),
-        (Permissions::MANAGE_CHANNELS, "Manage Channels"),
-        (Permissions::MANAGE_ROLES, "Manage Roles"),
+        (Permissions::MANAGE_THREADS, "Manage Threads"),
+        (Permissions::MOVE_MEMBERS, "Move Members"),
+        (Permissions::MUTE_MEMBERS, "Mute Members"),
+        (Permissions::DEAFEN_MEMBERS, "Deafen Members"),
+        (Permissions::PRIORITY_SPEAKER, "Priority Speaker"),
+        (Permissions::VIEW_AUDIT_LOG, "View Audit Log"),
         (Permissions::VIEW_CHANNEL, "View Channel"),
-        (Permissions::READ_MESSAGE_HISTORY, "Read Message History"),
         (Permissions::SEND_MESSAGES, "Send Messages"),
+        (Permissions::SEND_MESSAGES_IN_THREADS, "Send Messages in Threads"),
+        (Permissions::READ_MESSAGE_HISTORY, "Read Message History"),
+        (Permissions::ADD_REACTIONS, "Add Reactions"),
+        (Permissions::USE_EXTERNAL_EMOJIS, "Use External Emojis"),
+        (Permissions::CONNECT, "Connect Voice"),
+        (Permissions::SPEAK, "Speak in Voice"),
         (Permissions::MENTION_EVERYONE, "Mention @everyone"),
-        (Permissions::ADMINISTRATOR, "Administrator"),
+        (Permissions::CHANGE_NICKNAME, "Change Nickname"),
     ];
     let names: Vec<&str> = NAMES
         .iter()
@@ -128,7 +200,11 @@ impl ToolGuard {
                 ));
             }
             if let Some(ch) = channel {
-                if !auth.bypass && !auth.is_guild_owner {
+                // Administrator bypasses channel overwrites entirely (Discord
+                // semantics), as do the guild owner and bot owner. Everyone
+                // else is checked against the cached overwrite view.
+                let admin_bypass = auth.permissions.contains(Permissions::ADMINISTRATOR);
+                if !auth.bypass && !auth.is_guild_owner && !admin_bypass {
                     // Channel overwrites are only checked when cached. On a
                     // cache miss we deliberately fail OPEN (rely on the
                     // guild-level check above) rather than false-denying —
@@ -158,6 +234,19 @@ impl ToolGuard {
         if targets_role(tool) {
             let role_id = parse_role_id(args, "role_id").map_err(|e| format!("{tool}: {e}"))?;
             self.check_role(ctx, tool, role_id).await?;
+            // set_role_permissions replaces the whole bitset: the requester may
+            // not grant permissions they don't hold themselves.
+            if tool == "set_role_permissions" && !auth.bypass && !auth.is_guild_owner {
+                if let Some(bits) = args.get("permissions").and_then(|v| v.as_u64()) {
+                    if let Some(wanted) = Permissions::from_bits(bits) {
+                        if !auth.permissions.contains(wanted) {
+                            return deny(format!(
+                                "the requested permission set ({bits}) includes permissions the requester doesn't have. They can't grant what they don't hold — ask an admin who has those permissions."
+                            ));
+                        }
+                    }
+                }
+            }
         }
 
         // Self/bot protection runs even for the bot owner bypass: the model
@@ -174,8 +263,15 @@ impl ToolGuard {
                     ));
                 }
             }
-            if matches!(tool, "kick_member" | "ban_member" | "timeout_member")
-                && target == auth.user_id
+            if matches!(
+                tool,
+                "kick_member"
+                    | "ban_member"
+                    | "timeout_member"
+                    | "mute_voice_member"
+                    | "deafen_voice_member"
+                    | "disconnect_voice_member"
+            ) && target == auth.user_id
             {
                 return Err(format!(
                     "{tool}: refusing to moderate the requester themselves. Ask for clarification instead."
