@@ -132,7 +132,15 @@ mod tests {
 
     #[test]
     fn user_turn_flags_owner_override() {
-        let owner_turn = user_turn(1, 2, 3, "owner", "redesign the server, I allow you", true, false);
+        let owner_turn = user_turn(
+            1,
+            2,
+            3,
+            "owner",
+            "redesign the server, I allow you",
+            true,
+            false,
+        );
         let text = owner_turn["parts"][0]["text"].as_str().unwrap();
         assert!(text.contains("IsGuildOwner = true"));
         assert!(text.contains("IsBotOwner = false"));

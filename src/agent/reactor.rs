@@ -314,9 +314,15 @@ async fn run_tool(
     // key propagates into memory history, the DB, and Discord.
     let (scrubbed_text, had_key) = crate::utils::scrub_google_keys(&raw_text);
     if had_key {
-        tracing::warn!(tool = name, "Tool output contained an API key; redacted before reuse");
+        tracing::warn!(
+            tool = name,
+            "Tool output contained an API key; redacted before reuse"
+        );
     }
-    let text = truncate_chars(&scrubbed_text, if ok { max_output } else { max_output.min(2000) });
+    let text = truncate_chars(
+        &scrubbed_text,
+        if ok { max_output } else { max_output.min(2000) },
+    );
     let ms = started.elapsed().as_millis() as u64;
     if tools::is_destructive(name) {
         // NEVER log raw args: send_message/topic/nickname content could carry

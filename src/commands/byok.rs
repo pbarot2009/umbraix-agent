@@ -506,16 +506,22 @@ pub async fn status(ctx: &Context, inv: Invocation) {
             .unwrap_or(false);
         let fresh_roles =
             access::fresh_member_roles(ctx, gid, inv.user_id, &inv.member_roles).await;
-        let verdict =
-            match access::resolve_with_snapshot(ctx, uid, Some((gid, is_guild_owner, &fresh_roles)), snapshot.as_ref()).await {
-                Ok(Ok(g)) => format!(
-                    "✅ your requests here use the **{}** (`{}`)",
-                    g.source.label(),
-                    g.model
-                ),
-                Ok(Err(_)) => "❌ no access here yet".into(),
-                Err(_) => "unknown".into(),
-            };
+        let verdict = match access::resolve_with_snapshot(
+            ctx,
+            uid,
+            Some((gid, is_guild_owner, &fresh_roles)),
+            snapshot.as_ref(),
+        )
+        .await
+        {
+            Ok(Ok(g)) => format!(
+                "✅ your requests here use the **{}** (`{}`)",
+                g.source.label(),
+                g.model
+            ),
+            Ok(Err(_)) => "❌ no access here yet".into(),
+            Err(_) => "unknown".into(),
+        };
         lines.push(format!("\n**Your access:** {verdict}"));
     } else if ctx.is_owner(uid) {
         lines.push("\n**Your access:** bot owner — operator key everywhere".into());

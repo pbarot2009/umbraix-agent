@@ -84,8 +84,7 @@ pub fn discord_code(raw: &str) -> &'static str {
         || raw.contains("504")
     {
         "DISCORD_UNAVAILABLE"
-    } else if raw.to_lowercase().contains("hierarchy")
-        || raw.to_lowercase().contains("higher role")
+    } else if raw.to_lowercase().contains("hierarchy") || raw.to_lowercase().contains("higher role")
     {
         "DISCORD_HIERARCHY"
     } else {

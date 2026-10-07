@@ -85,11 +85,7 @@ fn find_google_key(text: &str) -> Option<(usize, usize)> {
                         .map(is_key_char)
                         .unwrap_or(false);
                 let after_ok = end == text.len()
-                    || !text[end..]
-                        .chars()
-                        .next()
-                        .map(is_key_char)
-                        .unwrap_or(false);
+                    || !text[end..].chars().next().map(is_key_char).unwrap_or(false);
                 if before_ok && after_ok {
                     return Some((i, end));
                 }
@@ -153,8 +149,7 @@ mod tests {
     #[test]
     fn scrubs_keys() {
         let key = format!("AIza{}", "C".repeat(35));
-        let (cleaned, found) =
-            scrub_google_keys(&format!("a {key} b {key} c"));
+        let (cleaned, found) = scrub_google_keys(&format!("a {key} b {key} c"));
         assert!(found);
         assert!(!contains_google_key(&cleaned));
         assert_eq!(cleaned.matches(REDACTED_KEY).count(), 2);

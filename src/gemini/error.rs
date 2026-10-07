@@ -66,9 +66,7 @@ impl GeminiError {
             }
             GeminiError::QuotaExhausted(_) => Some(("quota exhausted", Duration::from_secs(900))),
             GeminiError::Precondition(_) => Some(("billing problem", Duration::from_secs(600))),
-            GeminiError::ServiceDisabled(_) => {
-                Some(("api disabled", Duration::from_secs(600)))
-            }
+            GeminiError::ServiceDisabled(_) => Some(("api disabled", Duration::from_secs(600))),
             _ => None,
         }
     }
@@ -132,8 +130,7 @@ impl GeminiError {
         let service_disabled = reason == "SERVICE_DISABLED"
             || message.contains("SERVICE_DISABLED")
             || message.contains("has not been used in project")
-            || message.contains("is disabled")
-                && message.contains("Enable it")
+            || message.contains("is disabled") && message.contains("Enable it")
             || message.contains("generativelanguage.googleapis.com")
                 && msg_lc.contains("not enabled");
         let billing = msg_lc.contains("billing")
@@ -146,8 +143,7 @@ impl GeminiError {
             || msg_lc.contains("unsupported country")
             || reason == "LOCATION_POLICY_VIOLATED";
         let safety_400 = msg_lc.contains("safety")
-            || msg_lc.contains("blocked")
-                && (msg_lc.contains("harm") || msg_lc.contains("policy"))
+            || msg_lc.contains("blocked") && (msg_lc.contains("harm") || msg_lc.contains("policy"))
             || rpc_status == "INVALID_ARGUMENT" && msg_lc.contains("prohibited");
         let too_large = msg_lc.contains("too large")
             || msg_lc.contains("max output tokens")
@@ -190,7 +186,9 @@ impl GeminiError {
             } else {
                 short
             }),
-            405 => GeminiError::BadRequest("Method not allowed (HTTP 405) — the bot sent an unsupported operation.".into()),
+            405 => GeminiError::BadRequest(
+                "Method not allowed (HTTP 405) — the bot sent an unsupported operation.".into(),
+            ),
             408 => GeminiError::Timeout,
             409 => GeminiError::BadRequest(if short.is_empty() {
                 "Conflicting request (HTTP 409).".into()

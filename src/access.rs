@@ -195,11 +195,7 @@ impl GuildSnapshot {
     /// Returns true when the role exists after the refresh.
     /// This fixes the classic false-deny: role created/renamed seconds ago,
     /// gateway cache hasn't caught up, guard says "role does not exist".
-    pub async fn ensure_role_present(
-        &mut self,
-        ctx: &Context,
-        role_id: Id<RoleMarker>,
-    ) -> bool {
+    pub async fn ensure_role_present(&mut self, ctx: &Context, role_id: Id<RoleMarker>) -> bool {
         if self.roles.contains_key(&role_id) {
             return true;
         }
@@ -445,8 +441,8 @@ pub async fn resolve_with_snapshot(
         }
         if let Some(k) = ctx.store.get_key(KeyOwner::Guild(gid.get())).await? {
             server_has_key = true;
-            let has_role = effective_role
-                .is_some_and(|r| member_roles.iter().any(|m| m.get() == r));
+            let has_role =
+                effective_role.is_some_and(|r| member_roles.iter().any(|m| m.get() == r));
             if is_guild_owner || has_role {
                 return Ok(Ok(Grant {
                     source: KeySource::Server,

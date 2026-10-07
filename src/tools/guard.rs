@@ -278,7 +278,10 @@ impl ToolGuard {
         // set_nickname on self and remove_timeout on self are harmless and
         // explicitly allowed (self-unnick, self-unmute requests).
         if target == auth.user_id
-            && matches!(tool, "set_nickname" | "remove_timeout" | "assign_role" | "remove_role")
+            && matches!(
+                tool,
+                "set_nickname" | "remove_timeout" | "assign_role" | "remove_role"
+            )
         {
             return Ok(());
         }
