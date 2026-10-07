@@ -1,5 +1,6 @@
 pub mod channels;
 pub mod extra;
+pub mod guard;
 pub mod helpers;
 pub mod info;
 pub mod moderation;
@@ -10,7 +11,8 @@ use serde_json::Value;
 use twilight_http::Client as DiscordHttp;
 use twilight_model::id::{marker::GuildMarker, Id};
 
-pub use schemas::{build_tools_declaration, is_destructive, tool_names};
+pub use guard::ToolGuard;
+pub use schemas::{build_tools_declaration, is_destructive, is_read_only, tool_names};
 
 /// Central dispatcher: tool name (from Gemini `functionCall`) -> executor.
 ///

@@ -5,112 +5,101 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-/// Per-channel conversation history used to give Gemini multi-turn context.
+/// Conversation key: `(channel_id, user_id)`.
 ///
-/// Stores raw Gemini `Content` objects (`{"role": ..., "parts": [...]}`) so
-/// they can be replayed verbatim in the next `generateContent` call.
-/// Bounded by `limit` entries per channel (each user/model round-trip counts
-/// as two entries).
+/// History is per user *and* per channel so one user's conversation is
+/// never replayed to Gemini under another user's API key.
+pub type MemoryKey = (u64, u64);
+
+/// Bounded multi-turn history replayed verbatim to Gemini.
 ///
-/// `MAX_CHANNELS` bounds the number of tracked channels so a bot sitting in
-/// many channels cannot grow memory without bound; the oldest-touched
-/// channel is evicted first (approximate LRU via insertion order refresh).
+/// Stores raw Gemini `Content` objects and guarantees the retained window
+/// always starts at a plain user turn, so a trimmed history never begins
+/// with an orphaned `functionResponse` (which Gemini rejects with HTTP 400).
 #[derive(Debug, Clone)]
 pub struct ConversationMemory {
-    inner: Arc<Mutex<HashMap<u64, VecDeque<Value>>>>,
-    touched: Arc<Mutex<VecDeque<u64>>>,
+    inner: Arc<Mutex<State>>,
     limit: usize,
 }
 
-const MAX_CHANNELS: usize = 500;
+#[derive(Debug, Default)]
+struct State {
+    map: HashMap<MemoryKey, VecDeque<Value>>,
+    touched: VecDeque<MemoryKey>,
+}
+
+const MAX_CONVERSATIONS: usize = 5_000;
+
+fn is_plain_user_turn(v: &Value) -> bool {
+    v.get("role").and_then(|r| r.as_str()) == Some("user")
+        && v.get("parts")
+            .and_then(|p| p.as_array())
+            .map(|parts| parts.iter().all(|p| p.get("functionResponse").is_none()))
+            .unwrap_or(false)
+}
+
+fn trim_to_user_start(queue: &mut VecDeque<Value>) {
+    while queue.front().is_some_and(|v| !is_plain_user_turn(v)) {
+        queue.pop_front();
+    }
+}
 
 impl ConversationMemory {
     pub fn new(limit: usize) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
-            touched: Arc::new(Mutex::new(VecDeque::new())),
+            inner: Arc::new(Mutex::new(State::default())),
             limit,
         }
     }
 
-    /// Build the `contents` array for the next model call:
-    /// retained history followed by the new user turn.
-    pub async fn build_contents(&self, channel_id: u64, user_turn: Value) -> Vec<Value> {
+    pub async fn history(&self, key: MemoryKey) -> Vec<Value> {
         let guard = self.inner.lock().await;
-        let mut contents: Vec<Value> = guard
-            .get(&channel_id)
+        guard
+            .map
+            .get(&key)
             .map(|q| q.iter().cloned().collect())
-            .unwrap_or_default();
-        contents.push(user_turn);
-        contents
+            .unwrap_or_default()
     }
 
-    /// Append a full round-trip (user turn already sent + model + tool parts).
-    /// `new_entries` should be in chronological order.
-    pub async fn record(&self, channel_id: u64, new_entries: Vec<Value>) {
+    /// Append one turn's entries (user turn, model calls, tool responses,
+    /// final answer) in chronological order.
+    pub async fn record(&self, key: MemoryKey, new_entries: Vec<Value>) {
         if self.limit == 0 || new_entries.is_empty() {
             return;
         }
-        // Cap a single turn's contribution so one huge 100-step trajectory
-        // cannot wipe the whole retained history; keep the tail (most recent
-        // grounding) plus the original user request.
-        let mut entries = new_entries;
-        if entries.len() > self.limit {
-            let mut capped = Vec::with_capacity(self.limit);
-            capped.push(entries.remove(0));
-            let tail = self.limit - 1;
-            capped.extend(
-                entries
-                    .into_iter()
-                    .rev()
-                    .take(tail)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev(),
-            );
-            entries = capped;
-        }
         let mut guard = self.inner.lock().await;
-        // Evict oldest channel when over capacity (and not this channel).
-        if !guard.contains_key(&channel_id) && guard.len() >= MAX_CHANNELS {
-            let victim = {
-                let touched = self.touched.lock().await;
-                touched.iter().find(|id| **id != channel_id).copied()
-            };
-            if let Some(victim) = victim {
-                guard.remove(&victim);
-                let mut touched = self.touched.lock().await;
-                touched.retain(|id| *id != victim);
+        if !guard.map.contains_key(&key) && guard.map.len() >= MAX_CONVERSATIONS {
+            if let Some(victim) = guard.touched.pop_front() {
+                guard.map.remove(&victim);
             }
         }
-        drop(guard);
-        {
-            let mut touched = self.touched.lock().await;
-            touched.retain(|id| *id != channel_id);
-            touched.push_back(channel_id);
+        guard.touched.retain(|k| *k != key);
+        guard.touched.push_back(key);
+        let limit = self.limit;
+        let queue = guard.map.entry(key).or_default();
+        queue.extend(new_entries);
+        while queue.len() > limit {
+            queue.pop_front();
         }
-        let mut guard = self.inner.lock().await;
-        let queue = guard.entry(channel_id).or_insert_with(VecDeque::new);
-        for entry in entries {
-            queue.push_back(entry);
-            while queue.len() > self.limit {
-                queue.pop_front();
-            }
+        trim_to_user_start(queue);
+        if queue.is_empty() {
+            guard.map.remove(&key);
+            guard.touched.retain(|k| *k != key);
         }
     }
 
-    /// Number of retained entries for a channel (for tests / diagnostics).
-    pub async fn len(&self, channel_id: u64) -> usize {
-        self.inner
-            .lock()
-            .await
-            .get(&channel_id)
-            .map_or(0, |q| q.len())
+    pub async fn len(&self, key: MemoryKey) -> usize {
+        self.inner.lock().await.map.get(&key).map_or(0, |q| q.len())
     }
 
-    pub async fn clear(&self, channel_id: u64) {
-        self.inner.lock().await.remove(&channel_id);
-        self.touched.lock().await.retain(|id| *id != channel_id);
+    pub async fn clear(&self, key: MemoryKey) {
+        let mut guard = self.inner.lock().await;
+        guard.map.remove(&key);
+        guard.touched.retain(|k| *k != key);
+    }
+
+    pub async fn conversations(&self) -> usize {
+        self.inner.lock().await.map.len()
     }
 }
 
@@ -119,21 +108,60 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[tokio::test]
-    async fn history_is_bounded() {
-        let mem = ConversationMemory::new(4);
-        mem.record(1, vec![json!({"a": 1}), json!({"a": 2})]).await;
-        mem.record(1, vec![json!({"a": 3}), json!({"a": 4}), json!({"a": 5})])
-            .await;
-        assert_eq!(mem.len(1).await, 4);
-        let contents = mem.build_contents(1, json!({"new": true})).await;
-        assert_eq!(contents.len(), 5); // 4 retained + 1 new
+    fn user(t: &str) -> Value {
+        json!({"role": "user", "parts": [{"text": t}]})
+    }
+    fn model_call() -> Value {
+        json!({"role": "model", "parts": [{"functionCall": {"name": "x", "args": {}}}]})
+    }
+    fn tool_resp() -> Value {
+        json!({"role": "user", "parts": [{"functionResponse": {"name": "x", "response": {}}}]})
+    }
+    fn model_text() -> Value {
+        json!({"role": "model", "parts": [{"text": "ok"}]})
     }
 
     #[tokio::test]
-    async fn channels_are_isolated() {
+    async fn history_is_bounded_and_starts_with_user() {
+        let mem = ConversationMemory::new(4);
+        mem.record((1, 1), vec![user("a"), model_text()]).await;
+        mem.record(
+            (1, 1),
+            vec![user("b"), model_call(), tool_resp(), model_text()],
+        )
+        .await;
+        let h = mem.history((1, 1)).await;
+        assert!(h.len() <= 4);
+        assert!(is_plain_user_turn(&h[0]));
+    }
+
+    #[tokio::test]
+    async fn never_starts_with_orphan_tool_response() {
+        let mem = ConversationMemory::new(3);
+        mem.record(
+            (1, 1),
+            vec![
+                user("a"),
+                model_call(),
+                tool_resp(),
+                model_call(),
+                tool_resp(),
+                model_text(),
+            ],
+        )
+        .await;
+        let h = mem.history((1, 1)).await;
+        assert!(h.is_empty() || is_plain_user_turn(&h[0]));
+    }
+
+    #[tokio::test]
+    async fn users_and_channels_are_isolated() {
         let mem = ConversationMemory::new(10);
-        mem.record(1, vec![serde_json::json!({})]).await;
-        assert_eq!(mem.len(2).await, 0);
+        mem.record((1, 1), vec![user("a")]).await;
+        assert_eq!(mem.len((1, 2)).await, 0);
+        assert_eq!(mem.len((2, 1)).await, 0);
+        assert_eq!(mem.len((1, 1)).await, 1);
+        mem.clear((1, 1)).await;
+        assert_eq!(mem.len((1, 1)).await, 0);
     }
 }

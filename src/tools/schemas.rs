@@ -90,6 +90,20 @@ pub fn is_destructive(name: &str) -> bool {
     )
 }
 
+/// Tools that only read state; safe to run concurrently within one step.
+pub fn is_read_only(name: &str) -> bool {
+    matches!(
+        name,
+        "list_channels"
+            | "user_info"
+            | "list_roles"
+            | "search_members"
+            | "server_info"
+            | "list_bans"
+            | "get_messages"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

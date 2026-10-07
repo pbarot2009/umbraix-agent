@@ -1,25 +1,17 @@
-use std::env;
+use std::{env, str::FromStr};
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Runtime configuration loaded from environment variables.
-///
-/// Required:
-/// - `DISCORD_TOKEN`
-/// - `GEMINI_API_KEY`
-/// - `OWNER_ID` (u64 snowflake)
-///
-/// Optional (with defaults):
-/// - `GEMINI_MODEL` (default: `gemini-flash-lite-latest`)
-/// - `MAX_ITERATIONS` (default: 10, clamped 1..=100)
-/// - `AGENT_TEMPERATURE` (default: 0.2)
-/// - `HISTORY_LIMIT` (default: 20, clamped 0..=100)
-/// - `RATE_LIMIT_SECS` (default: 3)
-/// - `TURN_TIMEOUT_SECS` (default: 300, clamped 30..=1800)
-/// - `MAX_TOOL_OUTPUT_CHARS` (default: 4000, clamped 500..=20000)
-#[derive(Debug, Clone)]
+/// See `.env.example` for every option and its default.
+#[derive(Clone)]
 pub struct Config {
     pub discord_token: String,
     pub gemini_api_key: String,
     pub owner_id: u64,
+    pub master_key: String,
+    pub database_url: String,
+    pub command_prefix: String,
     pub gemini_model: String,
     pub max_iterations: usize,
     pub temperature: f32,
@@ -27,93 +19,109 @@ pub struct Config {
     pub rate_limit_secs: u64,
     pub turn_timeout_secs: u64,
     pub max_tool_output_chars: usize,
+    pub max_concurrent_turns: usize,
+    pub max_concurrent_per_key: usize,
+    pub queue_timeout_secs: u64,
+    pub gemini_max_retries: u32,
+    pub gemini_request_timeout_secs: u64,
+    pub allow_agent_role_name: String,
+    pub byok_session_secs: u64,
+    pub error_log_channel_id: Option<u64>,
+    pub register_slash_commands: bool,
+    pub dev_guild_id: Option<u64>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("owner_id", &self.owner_id)
+            .field("database_url", &self.database_url)
+            .field("command_prefix", &self.command_prefix)
+            .field("gemini_model", &self.gemini_model)
+            .field("max_iterations", &self.max_iterations)
+            .field("max_concurrent_turns", &self.max_concurrent_turns)
+            .field("max_concurrent_per_key", &self.max_concurrent_per_key)
+            .finish_non_exhaustive()
+    }
+}
+
+fn required(name: &str) -> Result<String, BoxError> {
+    let v = env::var(name).map_err(|_| format!("{name} is missing. Set it in your .env file."))?;
+    let v = v.trim().to_string();
+    if v.is_empty() {
+        return Err(format!("{name} must not be empty.").into());
+    }
+    Ok(v)
+}
+
+fn parsed<T: FromStr>(name: &str, default: T) -> T {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<T>().ok())
+        .unwrap_or(default)
+}
+
+fn optional_id(name: &str) -> Option<u64> {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v != 0)
+}
+
+fn non_empty_or(name: &str, default: &str) -> String {
+    env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string())
 }
 
 impl Config {
-    pub fn from_env() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let discord_token = env::var("DISCORD_TOKEN").map_err(|_| {
-            "DISCORD_TOKEN is missing. Please set it in your .env file.".to_string()
-        })?;
-        let gemini_api_key = env::var("GEMINI_API_KEY").map_err(|_| {
-            "GEMINI_API_KEY is missing. Please set it in your .env file.".to_string()
-        })?;
-        let owner_id_str = env::var("OWNER_ID")
-            .map_err(|_| "OWNER_ID is missing. Please set it in your .env file.".to_string())?;
-        let owner_id: u64 = owner_id_str
-            .trim()
+    pub fn from_env() -> Result<Self, BoxError> {
+        let discord_token = required("DISCORD_TOKEN")?;
+        let gemini_api_key = required("GEMINI_API_KEY")?;
+        let owner_id: u64 = required("OWNER_ID")?
             .parse()
             .map_err(|_| "OWNER_ID must be a valid 64-bit integer.".to_string())?;
-
-        if discord_token.trim().is_empty() {
-            return Err("DISCORD_TOKEN must not be empty.".into());
-        }
-        if gemini_api_key.trim().is_empty() {
-            return Err("GEMINI_API_KEY must not be empty.".into());
-        }
-
-        let gemini_model =
-            env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-flash-lite-latest".to_string());
-        let gemini_model = gemini_model.trim().to_string();
-        if gemini_model.is_empty() {
-            return Err("GEMINI_MODEL must not be empty.".into());
-        }
-
-        // Real-world tasks (bulk moderation, channel setup, role grants)
-        // routinely need 30-60 tool steps. The old 25-step hard cap forced
-        // premature "ran out of steps" failures, so allow up to 100 steps
-        // with loop-detection + turn timeout as the real safety rails
-        // (instead of an artificially low step count).
-        let max_iterations = env::var("MAX_ITERATIONS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(10)
-            .clamp(1, 100);
-
-        let temperature = env::var("AGENT_TEMPERATURE")
-            .ok()
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .unwrap_or(0.2)
-            .clamp(0.0, 2.0);
-
-        let history_limit = env::var("HISTORY_LIMIT")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(20)
-            .clamp(0, 100);
-
-        let rate_limit_secs = env::var("RATE_LIMIT_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(3)
-            .clamp(1, 3600);
-
         if owner_id == 0 {
             return Err("OWNER_ID must be a valid non-zero snowflake.".into());
         }
+        let master_key = required("MASTER_KEY").map_err(|_| {
+            "MASTER_KEY is missing. Generate one with `openssl rand -base64 32` and put it in .env \
+             (it encrypts stored BYOK API keys — back it up, losing it makes stored keys unreadable)."
+                .to_string()
+        })?;
 
-        let turn_timeout_secs = env::var("TURN_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(300)
-            .clamp(30, 1800);
-
-        let max_tool_output_chars = env::var("MAX_TOOL_OUTPUT_CHARS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(4000)
-            .clamp(500, 20_000);
+        let command_prefix = non_empty_or("COMMAND_PREFIX", "!");
+        if command_prefix.chars().count() > 5 || command_prefix.contains(char::is_whitespace) {
+            return Err("COMMAND_PREFIX must be 1-5 non-whitespace characters.".into());
+        }
 
         Ok(Self {
             discord_token,
             gemini_api_key,
             owner_id,
-            gemini_model,
-            max_iterations,
-            temperature,
-            history_limit,
-            rate_limit_secs,
-            turn_timeout_secs,
-            max_tool_output_chars,
+            master_key,
+            database_url: non_empty_or("DATABASE_URL", "sqlite://data/umbraix.db"),
+            command_prefix,
+            gemini_model: non_empty_or("GEMINI_MODEL", "gemini-flash-lite-latest"),
+            max_iterations: parsed("MAX_ITERATIONS", 10usize).clamp(1, 100),
+            temperature: parsed("AGENT_TEMPERATURE", 0.2f32).clamp(0.0, 2.0),
+            history_limit: parsed("HISTORY_LIMIT", 20usize).clamp(0, 100),
+            rate_limit_secs: parsed("RATE_LIMIT_SECS", 3u64).clamp(1, 3600),
+            turn_timeout_secs: parsed("TURN_TIMEOUT_SECS", 300u64).clamp(30, 1800),
+            max_tool_output_chars: parsed("MAX_TOOL_OUTPUT_CHARS", 4000usize).clamp(500, 20_000),
+            max_concurrent_turns: parsed("MAX_CONCURRENT_TURNS", 128usize).clamp(1, 2048),
+            max_concurrent_per_key: parsed("MAX_CONCURRENT_PER_KEY", 8usize).clamp(1, 128),
+            queue_timeout_secs: parsed("QUEUE_TIMEOUT_SECS", 60u64).clamp(5, 600),
+            gemini_max_retries: parsed("GEMINI_MAX_RETRIES", 4u32).clamp(0, 8),
+            gemini_request_timeout_secs: parsed("GEMINI_REQUEST_TIMEOUT_SECS", 60u64)
+                .clamp(10, 300),
+            allow_agent_role_name: non_empty_or("ALLOW_AGENT_ROLE_NAME", "allow_agent"),
+            byok_session_secs: parsed("BYOK_SESSION_SECS", 300u64).clamp(60, 1800),
+            error_log_channel_id: optional_id("ERROR_LOG_CHANNEL_ID"),
+            register_slash_commands: parsed("REGISTER_SLASH_COMMANDS", true),
+            dev_guild_id: optional_id("DEV_GUILD_ID"),
         })
     }
 }
@@ -123,22 +131,47 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
 
-    // Env vars are process-global; without a lock these tests race each other
-    // when cargo runs them in parallel (one test's MAX_ITERATIONS leaks into
-    // another's defaults check).
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn lock_env() -> MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn with_env(vars: &[(&str, &str)], f: impl FnOnce()) {
+    const BASE: &[(&str, &str)] = &[
+        ("DISCORD_TOKEN", "x"),
+        ("GEMINI_API_KEY", "y"),
+        ("OWNER_ID", "123"),
+        ("MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+    ];
+
+    const OPTIONAL: &[&str] = &[
+        "GEMINI_MODEL",
+        "MAX_ITERATIONS",
+        "AGENT_TEMPERATURE",
+        "HISTORY_LIMIT",
+        "RATE_LIMIT_SECS",
+        "TURN_TIMEOUT_SECS",
+        "MAX_TOOL_OUTPUT_CHARS",
+        "MAX_CONCURRENT_TURNS",
+        "COMMAND_PREFIX",
+    ];
+
+    fn with_env(extra: &[(&str, &str)], f: impl FnOnce()) {
         let _guard = lock_env();
-        let saved: Vec<(String, Option<String>)> = vars
+        let keys: Vec<&str> = BASE
             .iter()
-            .map(|(k, _)| (k.to_string(), env::var(k).ok()))
+            .chain(extra.iter())
+            .map(|(k, _)| *k)
+            .chain(OPTIONAL.iter().copied())
             .collect();
-        for (k, v) in vars {
+        let saved: Vec<(String, Option<String>)> = keys
+            .iter()
+            .map(|k| (k.to_string(), env::var(k).ok()))
+            .collect();
+        for k in OPTIONAL {
+            unsafe { env::remove_var(k) };
+        }
+        for (k, v) in BASE.iter().chain(extra.iter()) {
             unsafe { env::set_var(k, v) };
         }
         f();
@@ -152,61 +185,53 @@ mod tests {
 
     #[test]
     fn defaults_are_applied() {
-        with_env(
-            &[
-                ("DISCORD_TOKEN", "x"),
-                ("GEMINI_API_KEY", "y"),
-                ("OWNER_ID", "123"),
-            ],
-            || {
-                unsafe {
-                    env::remove_var("GEMINI_MODEL");
-                    env::remove_var("MAX_ITERATIONS");
-                    env::remove_var("AGENT_TEMPERATURE");
-                    env::remove_var("HISTORY_LIMIT");
-                    env::remove_var("RATE_LIMIT_SECS");
-                    env::remove_var("TURN_TIMEOUT_SECS");
-                    env::remove_var("MAX_TOOL_OUTPUT_CHARS");
-                }
-                let cfg = Config::from_env().unwrap();
-                assert_eq!(cfg.owner_id, 123);
-                assert_eq!(cfg.gemini_model, "gemini-flash-lite-latest");
-                assert_eq!(cfg.max_iterations, 10);
-                assert_eq!(cfg.turn_timeout_secs, 300);
-                assert_eq!(cfg.max_tool_output_chars, 4000);
-            },
-        );
+        with_env(&[], || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.owner_id, 123);
+            assert_eq!(cfg.gemini_model, "gemini-flash-lite-latest");
+            assert_eq!(cfg.max_iterations, 10);
+            assert_eq!(cfg.turn_timeout_secs, 300);
+            assert_eq!(cfg.max_tool_output_chars, 4000);
+            assert_eq!(cfg.max_concurrent_turns, 128);
+            assert_eq!(cfg.command_prefix, "!");
+            assert_eq!(cfg.allow_agent_role_name, "allow_agent");
+        });
     }
 
     #[test]
     fn max_iterations_is_clamped() {
-        with_env(
-            &[
-                ("DISCORD_TOKEN", "x"),
-                ("GEMINI_API_KEY", "y"),
-                ("OWNER_ID", "123"),
-                ("MAX_ITERATIONS", "999"),
-            ],
-            || {
-                let cfg = Config::from_env().unwrap();
-                assert_eq!(cfg.max_iterations, 100);
-            },
-        );
+        with_env(&[("MAX_ITERATIONS", "999")], || {
+            assert_eq!(Config::from_env().unwrap().max_iterations, 100);
+        });
     }
 
     #[test]
     fn max_iterations_allows_real_world_budgets() {
-        with_env(
-            &[
-                ("DISCORD_TOKEN", "x"),
-                ("GEMINI_API_KEY", "y"),
-                ("OWNER_ID", "123"),
-                ("MAX_ITERATIONS", "60"),
-            ],
-            || {
-                let cfg = Config::from_env().unwrap();
-                assert_eq!(cfg.max_iterations, 60);
-            },
-        );
+        with_env(&[("MAX_ITERATIONS", "60")], || {
+            assert_eq!(Config::from_env().unwrap().max_iterations, 60);
+        });
+    }
+
+    #[test]
+    fn missing_master_key_is_explained() {
+        with_env(&[], || {
+            let saved = env::var("MASTER_KEY").ok();
+            unsafe { env::remove_var("MASTER_KEY") };
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(err.contains("openssl rand"));
+            if let Some(v) = saved {
+                unsafe { env::set_var("MASTER_KEY", v) };
+            }
+        });
+    }
+
+    #[test]
+    fn debug_does_not_leak_secrets() {
+        with_env(&[], || {
+            let cfg = Config::from_env().unwrap();
+            let dbg = format!("{cfg:?}");
+            assert!(!dbg.contains("AAAAAAAA"));
+            assert!(!dbg.contains("discord_token"));
+        });
     }
 }

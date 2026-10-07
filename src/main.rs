@@ -1,20 +1,37 @@
-use discord_gemini_agent::{config::Config, context::Context, discord, utils::logging};
+use umbraix_agent::{
+    brand,
+    config::Config,
+    context::Context,
+    discord,
+    storage::{Store, Vault},
+    utils::logging,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // 1. Install Rustls CryptoProvider (prevents process-level Rustls panic).
     let _ = rustls::crypto::ring::default_provider().install_default();
-
-    // 2. Load `.env` (ignored when variables are exported directly).
     dotenvy::dotenv().ok();
+    let _log_guard = logging::init();
 
-    // 3. Structured logging from `RUST_LOG` (defaults to `info`).
-    logging::init();
+    if let Err(e) = run().await {
+        tracing::error!(error = %e, "{} failed to start", brand::NAME);
+        return Err(e);
+    }
+    Ok(())
+}
 
-    // 4. Validate configuration from the environment.
+async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::from_env()?;
+    tracing::info!(
+        ?config,
+        "{} v{} configuration loaded",
+        brand::NAME,
+        brand::VERSION
+    );
 
-    // 5. Shared state + gateway loop (never returns under normal operation).
-    let ctx = Context::new(config);
+    let vault = Vault::from_base64(&config.master_key)?;
+    let store = Store::connect(&config.database_url, vault).await?;
+
+    let ctx = Context::new(config, store);
     discord::run(ctx).await
 }

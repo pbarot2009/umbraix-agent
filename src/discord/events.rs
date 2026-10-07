@@ -1,117 +1,128 @@
-use twilight_model::gateway::event::Event;
+use std::sync::atomic::Ordering;
+use twilight_model::{channel::Message, gateway::event::Event};
 
 use crate::{
-    agent,
+    brand::{self, Tone},
+    commands::{self, byok, Invocation},
     context::Context,
-    discord::permissions::{extract_prompt, is_owner_command},
+    discord::{interactions, reply::Responder},
+    utils,
 };
 
-/// Route one gateway event. Message handling is spawned so the gateway
-/// loop never blocks on Gemini round-trips.
+/// Route one gateway event. Called on its own task per event, so slow
+/// work here never blocks the shard.
 pub async fn handle_event(event: Event, ctx: Context) {
     match event {
         Event::Ready(ready) => {
+            let _ = ctx.app_id.set(ready.application.id);
+            let _ = ctx.bot_user_id.set(ready.user.id);
             tracing::info!(
-                "Gateway ready! Logged in as: {}#{}",
-                ready.user.name,
-                ready.user.discriminator
+                user = %ready.user.name,
+                id = %ready.user.id,
+                guilds = ready.guilds.len(),
+                shard = ?ready.shard,
+                "{} v{} connected",
+                brand::NAME,
+                brand::VERSION
             );
+            if ctx.config.register_slash_commands
+                && !ctx.commands_registered.swap(true, Ordering::Relaxed)
+            {
+                interactions::register_commands(&ctx).await;
+            }
         }
-        Event::MessageCreate(msg) => {
-            if !is_owner_command(&msg, &ctx.config) {
-                return;
-            }
-            let Some(prompt) = extract_prompt(&msg.content) else {
-                // `!ai` with no prompt: nudge instead of silent ignore.
-                if msg.content.trim() == "!ai" || msg.content.trim_start().starts_with("!ai ") {
-                    let ctx_clone = ctx.clone();
-                    let channel = msg.channel_id;
-                    tokio::spawn(async move {
-                        let _ = ctx_clone
-                            .http
-                            .create_message(channel)
-                            .content("Usage: `!ai <request>` · `!ai help` · `!ai clear` (clears this channel's history)")
-                            .await;
-                    });
-                }
-                return;
-            };
-
-            // Built-in control commands (no model call, no rate-limit burn).
-            let lowered = prompt.trim().to_lowercase();
-            if lowered == "help" || prompt.trim() == "?" {
-                let ctx_clone = ctx.clone();
-                let channel = msg.channel_id;
-                let steps = ctx.config.max_iterations;
-                tokio::spawn(async move {
-                    let _ = ctx_clone
-                        .http
-                        .create_message(channel)
-                        .content(&format!(
-                            "**Discord admin agent** (up to {steps} steps/request)\n\
-                            `!ai <request>` — e.g. `!ai list channels`, `!ai timeout @user 10m spam`\n\
-                            `!ai clear` — forget this channel's conversation history\n\
-                            Grounding is automatic: I resolve names via list_channels/list_roles/search_members before acting.\n\
-                            Destructive actions only run when you explicitly ask."
-                        ))
-                        .await;
-                });
-                return;
-            }
-            if lowered == "clear" || lowered == "reset" || lowered == "forget" {
-                let ctx_clone = ctx.clone();
-                let channel = msg.channel_id;
-                let channel_u64 = channel.get();
-                tokio::spawn(async move {
-                    ctx_clone.memory.clear(channel_u64).await;
-                    let _ = ctx_clone
-                        .http
-                        .create_message(channel)
-                        .content("Cleared this channel's conversation history.")
-                        .await;
-                });
-                return;
-            }
-
-            let user_id = msg.author.id.get();
-            if let Err(cooldown) = ctx.rate_limiter.check(user_id).await {
-                tracing::debug!(user_id, "Rate-limited !ai request");
-                let ctx_clone = ctx.clone();
-                let msg_clone = (*msg).clone();
-                tokio::spawn(async move {
-                    let _ = ctx_clone
-                        .http
-                        .create_message(msg_clone.channel_id)
-                        .content(&format!(
-                            "Slow down — try again in {}s.",
-                            cooldown.retry_after_secs
-                        ))
-                        .await;
-                });
-                return;
-            }
-
-            let ctx_clone = ctx.clone();
-            let msg_obj = (*msg).clone();
-            tokio::spawn(async move {
-                if let Err(e) = agent::run_agent_turn(&msg_obj, prompt, &ctx_clone).await {
-                    tracing::error!(?e, "Error executing agent turn");
-                    // Surface a truncated real error instead of a generic
-                    // "something went wrong" so the owner can self-diagnose
-                    // (bad args, missing perms, model outage) without logs.
-                    let mut detail = e.to_string();
-                    if detail.len() > 400 {
-                        detail.truncate(400);
-                        detail.push('…');
-                    }
-                    let _ = ctx_clone
-                        .http
-                        .create_message(msg_obj.channel_id)
-                        .content(&format!("Something went wrong: {detail}"))
-                        .await;
-                }
-            });
+        Event::GuildCreate(g) => {
+            tracing::debug!(guild = %g.id(), "Guild available");
         }
+        Event::GuildDelete(g) => {
+            if g.unavailable.is_none() || g.unavailable == Some(false) {
+                tracing::info!(guild = %g.id, "Removed from guild; purging its stored key and settings");
+                if let Err(e) = ctx.store.purge_guild(g.id.get()).await {
+                    tracing::error!(guild = %g.id, error = %e, "Failed to purge guild data");
+                }
+            } else {
+                tracing::warn!(guild = %g.id, "Guild became unavailable (outage)");
+            }
+        }
+        Event::MessageCreate(msg) => on_message(&ctx, &msg.0).await,
+        Event::InteractionCreate(i) => interactions::handle(&ctx, i.0).await,
         _ => {}
     }
+}
+
+async fn on_message(ctx: &Context, msg: &Message) {
+    if msg.author.bot {
+        return;
+    }
+
+    if msg.guild_id.is_some() && utils::contains_google_key(&msg.content) {
+        protect_leaked_key(ctx, msg).await;
+        return;
+    }
+
+    if msg.guild_id.is_none() && byok::handle_dm_text(ctx, msg).await {
+        return;
+    }
+
+    let Some((name, args)) = commands::parse_prefixed(&msg.content, ctx.prefix()) else {
+        if msg.guild_id.is_none() && utils::contains_google_key(&msg.content) {
+            let r = Responder::channel(msg.channel_id, Some(msg.id));
+            r.info(
+                ctx,
+                Tone::Info,
+                "No key setup in progress",
+                &format!(
+                    "Run `{}byok-user` first, then send the key (or use the secure button).",
+                    ctx.prefix()
+                ),
+                false,
+            )
+            .await;
+        }
+        return;
+    };
+    let Some(spec) = commands::find(&name) else {
+        return;
+    };
+    let inv = Invocation {
+        user_id: msg.author.id,
+        user_name: msg.author.name.clone(),
+        guild_id: msg.guild_id,
+        channel_id: Some(msg.channel_id),
+        member_roles: msg
+            .member
+            .as_ref()
+            .map(|m| m.roles.clone())
+            .unwrap_or_default(),
+        request_id: utils::short_id(8),
+        responder: Responder::channel(msg.channel_id, Some(msg.id)),
+        is_slash: false,
+    };
+    commands::dispatch(ctx, inv, spec, args.to_string()).await;
+}
+
+/// Someone pasted an API key in a server channel: delete it and warn.
+async fn protect_leaked_key(ctx: &Context, msg: &Message) {
+    let deleted = ctx
+        .http
+        .delete_message(msg.channel_id, msg.id)
+        .await
+        .is_ok();
+    tracing::warn!(user = %msg.author.id, channel = %msg.channel_id, deleted, "API key posted in a public channel");
+    let body = format!(
+        "<@{}> {}\n\nAnyone who saw it can use it — **revoke it now** at https://aistudio.google.com/apikey and create a new one. \
+         To add a key safely use `/byok-user` (private form) or `{}byok-user` (DM).",
+        msg.author.id,
+        if deleted {
+            "I deleted your message because it contained an API key."
+        } else {
+            "your message contains an API key and I couldn't delete it (I need **Manage Messages**)."
+        },
+        ctx.prefix()
+    );
+    let _ = ctx
+        .http
+        .create_message(msg.channel_id)
+        .embeds(&[brand::embed(Tone::Warn, "Secret detected", &body)])
+        .await;
 }

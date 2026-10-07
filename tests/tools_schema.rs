@@ -1,4 +1,4 @@
-use discord_gemini_agent::tools;
+use umbraix_agent::tools;
 
 #[test]
 fn tools_declaration_shape_matches_gemini_api() {

@@ -1,7 +1,13 @@
+pub mod access;
 pub mod agent;
+pub mod brand;
+pub mod commands;
+pub mod concurrency;
 pub mod config;
 pub mod context;
 pub mod discord;
+pub mod error;
 pub mod gemini;
+pub mod storage;
 pub mod tools;
 pub mod utils;

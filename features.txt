@@ -1,0 +1,23 @@
+Features needed for the Umbraix Agent v0.2 (rename the all old refs of name with this new name and add/update version).
+
+1. BYOK Mode:
+	1.1 Indivisual/User BYOK:
+		- Users store their own Gemini API so they can use own there own,
+	1.2 Server BYOK:
+		- Server can also do same store so there all team/staff memebrs can use this both's ai features.
+		- this will automaticllly makes the `allow_agent` role and in the server only owner of server and those people who has allow_agent role can only use the ai features means this agent and the api will be there own.
+
+2. Owner Mode:
+	- Means me i can use the current sytsem api key and and i don't have any restrition in any server. (always one)
+
+Also make sure to add new command !byok-user and !byok-server
+these command will dm make bot to dm user and collect the API Key and get them and store them in a database (rust supported).
+
+Also more better error messages for error handling and also focus on bot's identity and branding too.
+
+Users can use the bot in any server means if user has 1.1 feature enabled so they can use the bot anywhere where the bot is means those does not conflict with the server byok things. also we need bunch on new config, ultilitie command and a help menu and command and all synced and linked well.
+
+also we need to refine and make robust pipeline so the all gemini calls can be run the prelle as i want to make this production level bot so many server can use. so i want to make that this bot can handle the atleat 100 users requrest at the same time.
+
+NOTE: also update the logging add more logging and things
+NOTE: More better error recovery, retry, and reporting 
