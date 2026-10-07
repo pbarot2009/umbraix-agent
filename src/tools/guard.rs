@@ -27,6 +27,9 @@ pub struct ToolGuard {
     pub guild_id: Id<GuildMarker>,
     pub snapshot: Arc<GuildSnapshot>,
     pub authority: Authority,
+    /// The bot's own user id, when known. Used to block self-harm
+    /// (the model must never kick/ban/timeout the bot itself).
+    pub bot_id: Option<Id<UserMarker>>,
 }
 
 pub fn required_permission(tool: &str) -> Option<Permissions> {
@@ -118,17 +121,23 @@ impl ToolGuard {
 
         if let Some(req) = required {
             if !auth.has(req) {
+                let missing = req - (req & auth.permissions);
                 return deny(format!(
-                    "the requester lacks **{}** in this server.",
-                    permission_label(req - (req & auth.permissions))
+                    "the requester lacks **{}** in this server. Ask a server admin/owner to grant it, or ask them to run this action. Do not retry without it.",
+                    permission_label(missing)
                 ));
             }
             if let Some(ch) = channel {
                 if !auth.bypass && !auth.is_guild_owner {
+                    // Channel overwrites are only checked when cached. On a
+                    // cache miss we deliberately fail OPEN (rely on the
+                    // guild-level check above) rather than false-denying —
+                    // Discord itself will still block the bot if *it* lacks
+                    // access, and that error is surfaced with a clear hint.
                     if let Ok(cp) = ctx.cache.permissions().in_channel(auth.user_id, ch) {
                         if !cp.contains(req) {
                             return deny(format!(
-                                "the requester lacks **{}** in <#{ch}>.",
+                                "the requester lacks **{}** in <#{ch}> (channel overwrite). Ask a moderator with Manage Channels to grant it there.",
                                 permission_label(req - (req & cp))
                             ));
                         }
@@ -142,13 +151,36 @@ impl ToolGuard {
             if (content.contains("@everyone") || content.contains("@here"))
                 && !auth.has(Permissions::MENTION_EVERYONE)
             {
-                return deny("the requester can't mention @everyone/@here.");
+                return deny("the requester can't mention @everyone/@here (needs Mention Everyone). Remove the mass mention or ask a moderator.");
             }
         }
 
         if targets_role(tool) {
             let role_id = parse_role_id(args, "role_id").map_err(|e| format!("{tool}: {e}"))?;
-            self.check_role(tool, role_id)?;
+            self.check_role(ctx, tool, role_id).await?;
+        }
+
+        // Self/bot protection runs even for the bot owner bypass: the model
+        // must never kick/ban/timeout itself or the bot.
+        if let Ok(target) = parse_user_id(args, "user_id") {
+            let bot_id_u64: Option<u64> = self
+                .bot_id
+                .map(|b| b.get())
+                .or_else(|| ctx.bot_user_id.get().map(|b| b.get()));
+            if let Some(bot_u64) = bot_id_u64 {
+                if target.get() == bot_u64 {
+                    return Err(format!(
+                        "{tool}: refusing to target the bot itself. Ask for clarification instead."
+                    ));
+                }
+            }
+            if matches!(tool, "kick_member" | "ban_member" | "timeout_member")
+                && target == auth.user_id
+            {
+                return Err(format!(
+                    "{tool}: refusing to moderate the requester themselves. Ask for clarification instead."
+                ));
+            }
         }
 
         if targets_member(tool) && !auth.bypass {
@@ -158,16 +190,55 @@ impl ToolGuard {
         Ok(())
     }
 
-    fn check_role(&self, tool: &str, role_id: Id<RoleMarker>) -> Result<(), String> {
+    async fn check_role(
+        &self,
+        ctx: &Context,
+        tool: &str,
+        role_id: Id<RoleMarker>,
+    ) -> Result<(), String> {
         if role_id == self.guild_id.cast::<RoleMarker>() {
             return Err(format!(
                 "{tool}: @everyone can't be assigned, removed or deleted."
             ));
         }
-        let Some(info) = self.snapshot.roles.get(&role_id) else {
-            return Err(format!(
-                "{tool}: role {role_id} does not exist in this server. Use list_roles to find the right ID."
-            ));
+        // Fast path: snapshot hit.
+        let info_opt = self.snapshot.roles.get(&role_id).cloned();
+        let info = match info_opt {
+            Some(i) => i,
+            None => {
+                // Slow path: snapshot may be stale (role created seconds ago).
+                // Verify over HTTP once instead of false-denying.
+                match ctx.http.roles(self.guild_id).await {
+                    Ok(resp) => match resp.model().await {
+                        Ok(roles) => {
+                            let found = roles.iter().find(|r| r.id == role_id);
+                            match found {
+                                Some(r) => crate::access::RoleInfo {
+                                    name: r.name.clone(),
+                                    position: r.position,
+                                    permissions: r.permissions,
+                                    managed: r.managed,
+                                },
+                                None => {
+                                    return Err(format!(
+                                        "{tool}: role {role_id} does not exist in this server. Use list_roles to find the right ID and retry once."
+                                    ));
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            return Err(format!(
+                                "{tool}: role {role_id} is not in my cached view and I couldn't refresh it. Use list_roles to re-ground and retry once."
+                            ));
+                        }
+                    },
+                    Err(_) => {
+                        return Err(format!(
+                            "{tool}: role {role_id} is not in my cached view and I couldn't refresh it. Use list_roles to re-ground and retry once."
+                        ));
+                    }
+                }
+            }
         };
         if info.managed {
             return Err(format!(
@@ -181,8 +252,8 @@ impl ToolGuard {
         }
         if !auth.outranks(info.position) {
             return deny(format!(
-                "role '{}' is at or above the requester's highest role.",
-                info.name
+                "role '{}' (position {}) is at or above the requester's highest role. The requester's top role must be HIGHER — ask a higher moderator/owner, or move the requester's role above it in Server Settings → Roles.",
+                info.name, info.position
             ));
         }
         if tool == "assign_role"
@@ -190,7 +261,7 @@ impl ToolGuard {
             && !auth.permissions.contains(info.permissions)
         {
             return deny(format!(
-                "role '{}' grants permissions the requester doesn't have.",
+                "role '{}' grants permissions the requester doesn't have. They can't grant what they don't hold — ask an admin who has those permissions.",
                 info.name
             ));
         }
@@ -204,31 +275,44 @@ impl ToolGuard {
         target: Id<UserMarker>,
     ) -> Result<(), String> {
         let auth = &self.authority;
-        if target == auth.user_id {
+        // set_nickname on self and remove_timeout on self are harmless and
+        // explicitly allowed (self-unnick, self-unmute requests).
+        if target == auth.user_id
+            && matches!(tool, "set_nickname" | "remove_timeout" | "assign_role" | "remove_role")
+        {
             return Ok(());
         }
         if target == self.snapshot.owner_id && !auth.is_guild_owner {
-            return deny("the server owner can't be targeted.");
+            return deny("the server owner can't be targeted by a non-owner. Only the server owner (or bot owner) can moderate them.");
         }
-        let roles = match ctx.cache.member(self.guild_id, target) {
-            Some(m) => Some(m.roles().to_vec()),
-            None => match ctx.http.guild_member(self.guild_id, target).await {
-                Ok(resp) => resp.model().await.ok().map(|m| m.roles),
-                Err(_) => None,
-            },
+        // Always prefer a fresh HTTP fetch for the TARGET's roles too — the
+        // member cache may be missing (no GUILD_MEMBERS intent) or stale.
+        let roles = match ctx.http.guild_member(self.guild_id, target).await {
+            Ok(resp) => resp.model().await.ok().map(|m| m.roles),
+            Err(_) => ctx
+                .cache
+                .member(self.guild_id, target)
+                .map(|m| m.roles().to_vec()),
         };
         let Some(roles) = roles else {
             if tool == "ban_member" {
+                // Banning by ID works even when the user isn't (or no longer
+                // is) a member — allow it through.
                 return Ok(());
             }
             return Err(format!(
-                "{tool}: user {target} is not a member of this server. Use search_members to find them."
+                "{tool}: user {target} is not a member of this server (or I can't see them). Use search_members to find the right ID; if they left, ban_member by ID still works."
             ));
         };
         let pos = self.snapshot.top_position(&roles);
+        if pos == 0 && roles.iter().any(|r| !self.snapshot.roles.contains_key(r)) {
+            // Target has roles we don't know — our snapshot is stale, not the
+            // requester. Say so instead of a misleading hierarchy deny.
+            tracing::debug!(target = %target, "Target has unknown roles, hierarchy check may be stale");
+        }
         if !auth.outranks(pos) {
             return deny(format!(
-                "<@{target}>'s highest role is at or above the requester's."
+                "<@{target}>'s highest role (position {pos}) is at or above the requester's. Discord requires the requester's top role to be strictly HIGHER — ask a higher moderator/owner."
             ));
         }
         Ok(())

@@ -499,12 +499,15 @@ pub async fn status(ctx: &Context, inv: Invocation) {
                 "blocked"
             }
         ));
-        let is_guild_owner = GuildSnapshot::load(ctx, gid)
-            .await
+        let snapshot = GuildSnapshot::load(ctx, gid).await.ok();
+        let is_guild_owner = snapshot
+            .as_ref()
             .map(|s| s.owner_id == inv.user_id)
             .unwrap_or(false);
+        let fresh_roles =
+            access::fresh_member_roles(ctx, gid, inv.user_id, &inv.member_roles).await;
         let verdict =
-            match access::resolve(ctx, uid, Some((gid, is_guild_owner, &inv.member_roles))).await {
+            match access::resolve_with_snapshot(ctx, uid, Some((gid, is_guild_owner, &fresh_roles)), snapshot.as_ref()).await {
                 Ok(Ok(g)) => format!(
                     "✅ your requests here use the **{}** (`{}`)",
                     g.source.label(),

@@ -155,12 +155,59 @@ impl GuildSnapshot {
                     },
                 );
             }
+        } else {
+            // Cache had *something* but may still be stale (role created /
+            // deleted moments ago and the gateway event hasn't arrived yet).
+            // If the cached set looks suspiciously small compared to a fresh
+            // fetch we prefer HTTP. To avoid an extra HTTP call on every
+            // request, callers use `ensure_role_present` / `refresh` when a
+            // specific role lookup fails instead of always refetching here.
         }
         Ok(Self {
             guild_id,
             owner_id,
             roles,
         })
+    }
+
+    /// Re-fetch roles + owner over HTTP and replace the cached view.
+    /// Call when a role lookup fails — the in-memory cache may be stale.
+    pub async fn refresh(&mut self, ctx: &Context) -> Result<(), BotError> {
+        let guild = ctx.http.guild(self.guild_id).await?.model().await?;
+        self.owner_id = guild.owner_id;
+        let mut roles = HashMap::new();
+        for r in ctx.http.roles(self.guild_id).await?.model().await? {
+            roles.insert(
+                r.id,
+                RoleInfo {
+                    name: r.name,
+                    position: r.position,
+                    permissions: r.permissions,
+                    managed: r.managed,
+                },
+            );
+        }
+        self.roles = roles;
+        Ok(())
+    }
+
+    /// If `role_id` isn't in this snapshot, refresh once over HTTP.
+    /// Returns true when the role exists after the refresh.
+    /// This fixes the classic false-deny: role created/renamed seconds ago,
+    /// gateway cache hasn't caught up, guard says "role does not exist".
+    pub async fn ensure_role_present(
+        &mut self,
+        ctx: &Context,
+        role_id: Id<RoleMarker>,
+    ) -> bool {
+        if self.roles.contains_key(&role_id) {
+            return true;
+        }
+        tracing::debug!(guild = %self.guild_id, role = %role_id, "Role missing from snapshot, refreshing over HTTP");
+        if self.refresh(ctx).await.is_ok() {
+            return self.roles.contains_key(&role_id);
+        }
+        false
     }
 
     pub fn top_position(&self, member_roles: &[Id<RoleMarker>]) -> i64 {
@@ -244,14 +291,86 @@ impl Authority {
 /// `(guild, requester_is_guild_owner, requester_role_ids)`.
 pub type GuildRequester<'a> = (Id<GuildMarker>, bool, &'a [Id<RoleMarker>]);
 
+/// Fetch authoritative member roles over HTTP, falling back to the gateway
+/// payload when the fetch fails.
+///
+/// The gateway `member.roles` payload can be empty/stale (missing
+/// `GUILD_MEMBERS` intent, uncached member, role changed seconds ago).
+/// Trusting it blindly is the #1 cause of "I have the role but the bot says
+/// I don't". Always try HTTP first for access decisions.
+pub async fn fresh_member_roles(
+    ctx: &Context,
+    guild_id: Id<GuildMarker>,
+    user_id: Id<UserMarker>,
+    fallback: &[Id<RoleMarker>],
+) -> Vec<Id<RoleMarker>> {
+    match ctx.http.guild_member(guild_id, user_id).await {
+        Ok(resp) => match resp.model().await {
+            Ok(m) => m.roles,
+            Err(e) => {
+                tracing::debug!(guild = %guild_id, user = %user_id, error = %e, "guild_member decode failed, using gateway roles");
+                fallback.to_vec()
+            }
+        },
+        Err(e) => {
+            tracing::debug!(guild = %guild_id, user = %user_id, error = %e, "guild_member fetch failed, using gateway roles");
+            fallback.to_vec()
+        }
+    }
+}
+
+/// Resolve the effective access role: the configured `allow_role_id` when it
+/// still exists, otherwise a role with the configured name (auto-heal for
+/// deleted/recreated roles).
+///
+/// Returns `(effective_role_id, healed)` where `healed` means the stored ID
+/// is stale and the caller should persist the healed ID.
+pub fn effective_allow_role(
+    allow_role_id: Option<u64>,
+    snapshot: Option<&GuildSnapshot>,
+    role_name: &str,
+) -> (Option<u64>, bool) {
+    let Some(snap) = snapshot else {
+        return (allow_role_id, false);
+    };
+    match allow_role_id.map(Id::<RoleMarker>::new) {
+        Some(id) if snap.roles.contains_key(&id) => (Some(id.get()), false),
+        Some(_) => {
+            // Stored ID points at a deleted role — try to heal by name.
+            match snap.find_role_by_name(role_name) {
+                Some(healed) => (Some(healed.get()), true),
+                None => (allow_role_id, false),
+            }
+        }
+        None => match snap.find_role_by_name(role_name) {
+            Some(found) => (Some(found.get()), true),
+            None => (None, false),
+        },
+    }
+}
+
 /// Decide which key (if any) serves this request.
 ///
 /// Order: bot owner → personal key (unless the server disabled personal
 /// keys) → server key (server owner or `allow_agent` role) → denied.
+///
+/// Pass `snapshot` when the caller already loaded one (the hot path does):
+/// it is used to auto-heal a stale `allow_role_id` (role deleted +
+/// recreated) and to recompute guild ownership authoritatively instead of
+/// trusting a possibly-stale boolean.
 pub async fn resolve(
     ctx: &Context,
     user_id: u64,
     guild: Option<GuildRequester<'_>>,
+) -> Result<Result<Grant, Denied>, BotError> {
+    resolve_with_snapshot(ctx, user_id, guild, None).await
+}
+
+pub async fn resolve_with_snapshot(
+    ctx: &Context,
+    user_id: u64,
+    guild: Option<GuildRequester<'_>>,
+    snapshot: Option<&GuildSnapshot>,
 ) -> Result<Result<Grant, Denied>, BotError> {
     let cfg = match guild {
         Some((gid, _, _)) => Some(ctx.store.guild_config(gid.get()).await?),
@@ -298,12 +417,35 @@ pub async fn resolve(
 
     let mut server_has_key = false;
     let mut role_id = None;
-    if let (Some((gid, is_guild_owner, member_roles)), Some(c)) = (guild, &cfg) {
-        role_id = c.allow_role_id;
+    if let (Some((gid, is_guild_owner_flag, member_roles)), Some(c)) = (guild, &cfg) {
+        // Authoritative ownership when we have a snapshot; otherwise trust flag.
+        let is_guild_owner = snapshot
+            .map(|s| s.owner_id.get() == user_id)
+            .unwrap_or(is_guild_owner_flag);
+        let (effective_role, healed) =
+            effective_allow_role(c.allow_role_id, snapshot, &ctx.config.allow_agent_role_name);
+        role_id = effective_role.or(c.allow_role_id);
+        // Persist the healed role ID in the background so the next request
+        // doesn't need to heal again (deleted role recreated with new ID,
+        // or role existed by name but config was never set).
+        if healed {
+            if let Some(healed_id) = effective_role {
+                let gid_u64 = gid.get();
+                let ctx_clone = ctx.clone();
+                tokio::spawn(async move {
+                    let _ = ctx_clone
+                        .store
+                        .update_guild_config(gid_u64, |cfg| {
+                            cfg.allow_role_id = Some(healed_id);
+                        })
+                        .await;
+                });
+                tracing::info!(guild = %gid, healed_role = healed_id, "Auto-healed stale allow_role_id");
+            }
+        }
         if let Some(k) = ctx.store.get_key(KeyOwner::Guild(gid.get())).await? {
             server_has_key = true;
-            let has_role = c
-                .allow_role_id
+            let has_role = effective_role
                 .is_some_and(|r| member_roles.iter().any(|m| m.get() == r));
             if is_guild_owner || has_role {
                 return Ok(Ok(Grant {

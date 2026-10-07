@@ -56,8 +56,68 @@ pub fn looks_like_google_key(token: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+fn is_key_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
+/// Substring scan: finds `AIza` + 35 key chars ANYWHERE in the text.
+///
+/// The old version only split on whitespace, so `key=AIza...`, `"AIza..."`,
+/// `` `AIza...` `` or `AIza...,` slipped through. This scans every `AIza`
+/// occurrence instead.
 pub fn contains_google_key(text: &str) -> bool {
-    text.split_whitespace().any(looks_like_google_key)
+    find_google_key(text).is_some()
+}
+
+fn find_google_key(text: &str) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 39 <= bytes.len() {
+        if &bytes[i..i + 4] == b"AIza" {
+            let end = i + 39;
+            if text[i..end].chars().all(is_key_char) {
+                // Require a non-key-char (or string edge) on both sides so we
+                // don't match a 50-char token that merely contains AIza.
+                let before_ok = i == 0
+                    || !text[..i]
+                        .chars()
+                        .next_back()
+                        .map(is_key_char)
+                        .unwrap_or(false);
+                let after_ok = end == text.len()
+                    || !text[end..]
+                        .chars()
+                        .next()
+                        .map(is_key_char)
+                        .unwrap_or(false);
+                if before_ok && after_ok {
+                    return Some((i, end));
+                }
+            }
+        }
+        // Advance by char, not byte, to stay on UTF-8 boundaries.
+        i += text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+    }
+    None
+}
+
+/// Redaction marker used everywhere a key might surface.
+pub const REDACTED_KEY: &str = "[REDACTED_API_KEY]";
+
+/// Replace every embedded Google API key with `[REDACTED_API_KEY]`.
+/// Returns `(cleaned, found_any)`.
+pub fn scrub_google_keys(text: &str) -> (String, bool) {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut found = false;
+    while let Some((s, e)) = find_google_key(rest) {
+        found = true;
+        out.push_str(&rest[..s]);
+        out.push_str(REDACTED_KEY);
+        rest = &rest[e..];
+    }
+    out.push_str(rest);
+    (out, found)
 }
 
 #[cfg(test)]
@@ -77,6 +137,30 @@ mod tests {
         assert!(looks_like_google_key(&key));
         assert!(contains_google_key(&format!("here is my key {key} thanks")));
         assert!(!contains_google_key("hello AIza world"));
+    }
+
+    #[test]
+    fn detects_embedded_keys() {
+        let key = format!("AIza{}", "B".repeat(35));
+        assert!(contains_google_key(&format!("key={key}")));
+        assert!(contains_google_key(&format!("`{key}`")));
+        assert!(contains_google_key(&format!("\"{key}\",")));
+        assert!(contains_google_key(&format!("my key is:{key}.")));
+        assert!(!contains_google_key("AIza short"));
+        assert!(!contains_google_key("no keys here at all"));
+    }
+
+    #[test]
+    fn scrubs_keys() {
+        let key = format!("AIza{}", "C".repeat(35));
+        let (cleaned, found) =
+            scrub_google_keys(&format!("a {key} b {key} c"));
+        assert!(found);
+        assert!(!contains_google_key(&cleaned));
+        assert_eq!(cleaned.matches(REDACTED_KEY).count(), 2);
+        let (same, none) = scrub_google_keys("nothing to hide");
+        assert!(!none);
+        assert_eq!(same, "nothing to hide");
     }
 
     #[test]

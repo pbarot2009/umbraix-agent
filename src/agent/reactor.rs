@@ -27,6 +27,12 @@ pub struct TurnRequest {
     pub user_name: String,
     pub prompt: String,
     pub request_id: String,
+    /// Whether the requester owns this guild (authoritative from snapshot).
+    /// Lets the model distinguish "owner explicitly authorizes a redesign"
+    /// from a vague destructive request by a non-owner.
+    pub is_guild_owner: bool,
+    /// Whether the requester is the bot operator (unrestricted key).
+    pub is_bot_owner: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -103,6 +109,8 @@ async fn run_inner(
         req.user_id.get(),
         &req.user_name,
         &req.prompt,
+        req.is_guild_owner,
+        req.is_bot_owner,
     );
 
     let mut contents = ctx.memory.history(mem_key).await;
@@ -139,9 +147,15 @@ async fn run_inner(
         let calls = types::extract_function_calls(&candidate);
 
         if calls.is_empty() {
-            let text = types::extract_text(&candidate)
+            let raw = types::extract_text(&candidate)
                 .filter(|t| !t.trim().is_empty())
                 .unwrap_or_else(|| "Done — the model returned no further text.".to_string());
+            // The model could echo a key it saw in grounded channel history.
+            // Scrub before storing in memory history and posting to Discord.
+            let (text, had_key) = crate::utils::scrub_google_keys(&raw);
+            if had_key {
+                tracing::warn!("Model output contained an API key; redacted before delivery");
+            }
             new_entries.push(candidate);
             ctx.memory.record(mem_key, new_entries).await;
             let footer = format!(
@@ -157,7 +171,8 @@ async fn run_inner(
 
         if let Some(text) = types::extract_text(&candidate) {
             if !text.trim().is_empty() {
-                tracing::debug!(iteration, text = %crate::utils::truncate_chars(&text, 300), "Model reasoning alongside tool calls");
+                let scrubbed = crate::utils::scrub_google_keys(&text).0;
+                tracing::debug!(iteration, text = %crate::utils::truncate_chars(&scrubbed, 300), "Model reasoning alongside tool calls");
             }
         }
         tracing::info!(iteration, count = calls.len(), "Executing tool calls");
@@ -286,31 +301,42 @@ async fn run_tool(
         return (denied, false);
     }
     let started = Instant::now();
-    let (text, ok) = match tools::execute_tool(name, args, req.guild_id, &ctx.http).await {
-        Ok(out) => (truncate_chars(&out, max_output), true),
+    let (raw_text, ok) = match tools::execute_tool(name, args, req.guild_id, &ctx.http).await {
+        Ok(out) => (out, true),
         Err(e) => (
-            truncate_chars(
-                &format!("Failed to execute {name}: {e}"),
-                max_output.min(2000),
-            ),
+            crate::error::friendly_tool_error(name, &e.to_string()),
             false,
         ),
     };
+    // Tool outputs can contain a leaked key (e.g. get_messages reading a
+    // channel where someone pasted one). Scrub BEFORE feeding back to the
+    // model, writing the audit row, or posting the guild log — otherwise the
+    // key propagates into memory history, the DB, and Discord.
+    let (scrubbed_text, had_key) = crate::utils::scrub_google_keys(&raw_text);
+    if had_key {
+        tracing::warn!(tool = name, "Tool output contained an API key; redacted before reuse");
+    }
+    let text = truncate_chars(&scrubbed_text, if ok { max_output } else { max_output.min(2000) });
     let ms = started.elapsed().as_millis() as u64;
     if tools::is_destructive(name) {
-        tracing::warn!(tool = name, ok, ms, ?args, "Destructive tool executed");
+        // NEVER log raw args: send_message/topic/nickname content could carry
+        // a key. Log the scrubbed serialization instead.
+        let args_log = crate::utils::scrub_google_keys(&args.to_string()).0;
+        tracing::warn!(tool = name, ok, ms, args = %crate::utils::truncate_chars(&args_log, 500), "Destructive tool executed");
     } else {
         tracing::info!(tool = name, ok, ms, "Tool executed");
     }
 
     if !tools::is_read_only(name) {
+        let args_scrubbed = crate::utils::scrub_google_keys(&args.to_string()).0;
         let entry = AuditEntry {
             guild_id: Some(req.guild_id.get()),
             user_id: req.user_id.get(),
             key_source: Some(grant.source.tag().to_string()),
             action: name.to_string(),
             detail: format!(
-                "args={args} result={}",
+                "args={} result={}",
+                crate::utils::truncate_chars(&args_scrubbed, 1000),
                 crate::utils::truncate_chars(&text, 500)
             ),
             success: ok,

@@ -27,7 +27,16 @@ const MAX_SERVER_DELAY: Duration = Duration::from_secs(60);
 ///   instead of retried.
 /// - Retries only transient errors (429 per-minute, 408, 5xx, network) with
 ///   exponential backoff + full jitter, honoring `RetryInfo`/`Retry-After`.
-/// - The key travels in the `x-goog-api-key` header, never in URLs/logs.
+///
+/// # Key-secrecy contract (audited)
+/// - The key travels ONLY in the `x-goog-api-key` header, never in URLs,
+///   query strings, request bodies, or logs. Only `ApiKey::hint()`
+///   (first 4 + last 4 chars) is ever logged.
+/// - `reqwest` errors are converted with `without_url()` so URLs can't leak.
+/// - Callers must scrub user prompts and tool outputs with
+///   `utils::scrub_google_keys` BEFORE building Gemini `contents` — this
+///   client never sees raw chat text containing keys.
+/// - Request/response bodies are never logged at any level.
 pub struct GeminiClient {
     http: reqwest::Client,
     max_retries: u32,
@@ -102,7 +111,24 @@ impl GeminiClient {
         self.paused.remove(&key.fingerprint());
     }
 
+    /// Drop expired pauses and cap map growth. Paused/gate entries are keyed
+    /// by fingerprint and would otherwise grow without bound as users come
+    /// and go. Called opportunistically from `generate`.
+    fn prune(&self) {
+        if self.paused.len() > 512 {
+            let now = Instant::now();
+            self.paused.retain(|_, (until, _)| *until > now);
+        }
+        // Semaphore gates hold no secrets (keyed by u64 hash) but also grow
+        // without bound; cap at a generous size — evicting a live gate only
+        // recreates its semaphore.
+        if self.gates.len() > 2000 {
+            self.gates.clear();
+        }
+    }
+
     pub async fn generate(&self, p: GenerateParams<'_>) -> Result<Value, GeminiError> {
+        self.prune();
         self.check_paused(p.api_key)?;
         let body = json!({
             "systemInstruction": p.system,

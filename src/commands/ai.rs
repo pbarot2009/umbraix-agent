@@ -34,6 +34,29 @@ pub async fn run(ctx: &Context, inv: Invocation, args: String) {
     if matches!(lowered.as_str(), "clear" | "reset" | "forget") {
         return util::clear(ctx, inv).await;
     }
+    // NEVER send a pasted API key to Gemini, store it in memory history, or
+    // write it to audit logs. Prefix guild messages are already intercepted
+    // by protect_leaked_key, but slash `/ai` bypasses that path — so check
+    // here for both. Refuse without touching the prompt further.
+    if crate::utils::contains_google_key(&prompt) {
+        tracing::warn!(user = %inv.user_id, guild = ?inv.guild_id, "AI prompt contained an API key; refused");
+        inv.responder
+            .info(
+                ctx,
+                Tone::Error,
+                "I can't accept API keys here",
+                &format!(
+                    "Your message looks like it contains a Gemini API key, so I stopped before sending anything to the AI.\n\n\
+                    Anyone who saw it can use it — **revoke it now** at https://aistudio.google.com/apikey and create a new one.\n\
+                    Then add keys only via `{}byok-user` (private form/DM) or `{}byok-server` (server owner). Never paste keys into chat or `/ai` prompts.",
+                    ctx.prefix(),
+                    ctx.prefix()
+                ),
+                true,
+            )
+            .await;
+        return;
+    }
     if ctx.is_shutting_down() {
         inv.responder
             .info(
@@ -50,9 +73,22 @@ pub async fn run(ctx: &Context, inv: Invocation, args: String) {
         return;
     };
     let user = inv.user_id.get();
+    let is_bot_owner = ctx.is_owner(user);
 
+    // Ack slash interactions immediately (Discord requires <3s). Prefix
+    // commands are a no-op. Doing this BEFORE slow snapshot/DB work prevents
+    // "Unknown interaction" under load.
+    if inv.is_slash {
+        if let Err(e) = inv.responder.defer(ctx, false).await {
+            tracing::warn!(error = %e, "Failed to defer interaction");
+        }
+    }
+
+    // One active turn per user — including the bot owner. The old code let
+    // the owner run unlimited parallel turns with the same (channel,user)
+    // memory key, interleaving histories and burning quota.
     let slot = ctx.limiter.try_claim_user(user);
-    if slot.is_none() && !ctx.is_owner(user) {
+    if slot.is_none() {
         inv.responder
             .info(
                 ctx,
@@ -72,10 +108,17 @@ pub async fn run(ctx: &Context, inv: Invocation, args: String) {
     };
     let is_guild_owner = snapshot.owner_id == inv.user_id;
 
-    let grant = match access::resolve(
+    // Gateway payload roles can be empty/stale. Fetch authoritative roles
+    // over HTTP for the access decision; fall back to payload on failure.
+    // This fixes "I have the role but the bot denies me".
+    let fresh_roles =
+        access::fresh_member_roles(ctx, guild_id, inv.user_id, &inv.member_roles).await;
+
+    let grant = match access::resolve_with_snapshot(
         ctx,
         user,
-        Some((guild_id, is_guild_owner, &inv.member_roles)),
+        Some((guild_id, is_guild_owner, &fresh_roles)),
+        Some(&snapshot),
     )
     .await
     {
@@ -140,14 +183,17 @@ pub async fn run(ctx: &Context, inv: Invocation, args: String) {
         }
     };
 
+    // For prefix commands defer is a no-op; for slash it was already done
+    // above (second call is harmless).
     if let Err(e) = inv.responder.defer(ctx, false).await {
-        tracing::warn!(error = %e, "Failed to defer interaction");
+        tracing::debug!(error = %e, "Defer after admission (already deferred)");
     }
 
     let guard = ToolGuard {
         guild_id,
-        authority: snapshot.authority(inv.user_id, &inv.member_roles, ctx.is_owner(user)),
+        authority: snapshot.authority(inv.user_id, &fresh_roles, is_bot_owner),
         snapshot: snapshot.clone(),
+        bot_id: ctx.bot_user_id.get().copied(),
     };
     let req = TurnRequest {
         guild_id,
@@ -156,6 +202,8 @@ pub async fn run(ctx: &Context, inv: Invocation, args: String) {
         user_name: inv.user_name.clone(),
         prompt,
         request_id: inv.request_id.clone(),
+        is_guild_owner,
+        is_bot_owner,
     };
 
     let span = tracing::info_span!(
