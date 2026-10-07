@@ -34,8 +34,9 @@ fn is_plain_user_turn(v: &Value) -> bool {
     v.get("role").and_then(|r| r.as_str()) == Some("user")
         && v.get("parts")
             .and_then(|p| p.as_array())
-            .map(|parts| parts.iter().all(|p| p.get("functionResponse").is_none()))
-            .unwrap_or(false)
+            .is_some_and(|parts| {
+                !parts.is_empty() && parts.iter().all(|p| p.get("functionResponse").is_none())
+            })
 }
 
 fn trim_to_user_start(queue: &mut VecDeque<Value>) {
@@ -67,17 +68,40 @@ impl ConversationMemory {
         if self.limit == 0 || new_entries.is_empty() {
             return;
         }
+        // Bound a single turn: cap entries and per-entry size so one huge
+        // tool dump can't blow memory (large outputs are truncated upstream,
+        // this is defence-in-depth).
+        const MAX_ENTRY_CHARS: usize = 24_000;
+        let mut entries = new_entries;
+        if entries.len() > 512 {
+            entries.truncate(512);
+        }
+        for e in &mut entries {
+            let s = e.to_string();
+            if s.len() > MAX_ENTRY_CHARS {
+                *e = serde_json::json!({"role": e.get("role").cloned().unwrap_or_default(), "parts": [{"text": "[truncated: entry too large]"}]});
+            }
+        }
         let mut guard = self.inner.lock().await;
-        if !guard.map.contains_key(&key) && guard.map.len() >= MAX_CONVERSATIONS {
-            if let Some(victim) = guard.touched.pop_front() {
+        if !guard.map.contains_key(&key) {
+            // Evict until under cap (stale `touched` entries may no-op).
+            while guard.map.len() >= MAX_CONVERSATIONS {
+                let Some(victim) = guard.touched.pop_front() else {
+                    break;
+                };
                 guard.map.remove(&victim);
             }
         }
         guard.touched.retain(|k| *k != key);
         guard.touched.push_back(key);
+        // Periodic prune of stale touched keys (keeps retain() cheap).
+        if guard.touched.len() > MAX_CONVERSATIONS * 2 {
+            let live: std::collections::HashSet<MemoryKey> = guard.map.keys().copied().collect();
+            guard.touched.retain(|k| live.contains(k));
+        }
         let limit = self.limit;
         let queue = guard.map.entry(key).or_default();
-        queue.extend(new_entries);
+        queue.extend(entries);
         while queue.len() > limit {
             queue.pop_front();
         }

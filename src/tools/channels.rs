@@ -5,7 +5,7 @@ use twilight_model::{
     id::{marker::GuildMarker, Id},
 };
 
-use super::helpers::{clamp_int_arg, get_str, parse_channel_id};
+use super::helpers::{get_str, parse_channel_id};
 
 fn channel_kind_label(kind: ChannelType) -> &'static str {
     match kind {
@@ -135,14 +135,20 @@ pub async fn create(
     if name.is_empty() {
         return Err("create_channel: 'name' is required and must not be empty.".into());
     }
-    if name.len() > 100 {
+    if name.chars().count() > 100 {
         return Err("create_channel: 'name' must be at most 100 characters.".into());
     }
     let kind = match get_str(args, "kind", "text").to_lowercase().as_str() {
+        "text" => ChannelType::GuildText,
         "voice" => ChannelType::GuildVoice,
         "announcement" => ChannelType::GuildAnnouncement,
         "category" => ChannelType::GuildCategory,
-        _ => ChannelType::GuildText,
+        other => {
+            return Err(format!(
+                "create_channel: unknown kind '{other}' (want text/voice/announcement/category)."
+            )
+            .into())
+        }
     };
     let topic = get_str(args, "topic", "");
 
@@ -184,7 +190,19 @@ pub async fn slowmode(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let channel_id =
         parse_channel_id(args, "channel_id").map_err(|e| format!("set_slowmode: {e}"))?;
-    let seconds = clamp_int_arg(args, "seconds", 0, 0, 21_600) as u16;
+    // Strict: out-of-range is a model error, not a silent rewrite.
+    let raw_seconds = args.get("seconds").and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_str()?.trim().parse::<u64>().ok())
+            .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
+    });
+    let Some(seconds_raw) = raw_seconds else {
+        return Err("set_slowmode: 'seconds' must be an integer 0-21600.".into());
+    };
+    if seconds_raw > 21_600 {
+        return Err("set_slowmode: 'seconds' must be 0-21600.".into());
+    }
+    let seconds = seconds_raw as u16;
 
     discord
         .update_channel(channel_id)

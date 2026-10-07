@@ -211,6 +211,12 @@ pub fn is_destructive(name: &str) -> bool {
             | "delete_invite"
             | "delete_webhook"
             | "delete_scheduled_event"
+            | "edit_server"
+            | "set_role_permissions"
+            | "set_channel_permissions"
+            | "clear_channel_permissions"
+            | "create_channel"
+            | "lock_channel"
     )
 }
 

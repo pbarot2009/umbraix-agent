@@ -1,4 +1,3 @@
-use std::sync::atomic::Ordering;
 use twilight_model::{channel::Message, gateway::event::Event};
 
 use crate::{
@@ -14,8 +13,7 @@ use crate::{
 pub async fn handle_event(event: Event, ctx: Context) {
     match event {
         Event::Ready(ready) => {
-            let _ = ctx.app_id.set(ready.application.id);
-            let _ = ctx.bot_user_id.set(ready.user.id);
+            ctx.init_ids(ready.application.id, ready.user.id);
             tracing::info!(
                 user = %ready.user.name,
                 id = %ready.user.id,
@@ -26,7 +24,9 @@ pub async fn handle_event(event: Event, ctx: Context) {
                 brand::VERSION
             );
             if ctx.config.register_slash_commands
-                && !ctx.commands_registered.swap(true, Ordering::Relaxed)
+                && !ctx
+                    .commands_registered
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
             {
                 interactions::register_commands(&ctx).await;
             }
@@ -45,13 +45,16 @@ pub async fn handle_event(event: Event, ctx: Context) {
             }
         }
         Event::MessageCreate(msg) => on_message(&ctx, &msg.0).await,
+        // MessageUpdate wraps a full Message: edits can smuggle a key past
+        // the create-time scan, so run the same handler (leak scan first).
+        Event::MessageUpdate(msg) => on_message(&ctx, &msg.0).await,
         Event::InteractionCreate(i) => interactions::handle(&ctx, i.0).await,
         _ => {}
     }
 }
 
 async fn on_message(ctx: &Context, msg: &Message) {
-    if msg.author.bot {
+    if msg.author.bot || msg.webhook_id.is_some() {
         return;
     }
 
@@ -72,7 +75,8 @@ async fn on_message(ctx: &Context, msg: &Message) {
                 Tone::Info,
                 "No key setup in progress",
                 &format!(
-                    "Run `{}byok-user` first, then send the key (or use the secure button).",
+                    "Run `{}byok-user` first, then send the key (or use the secure button). \
+                     Also delete the message above — DMs persist and anyone with access to this account could read it.",
                     ctx.prefix()
                 ),
                 false,
@@ -102,6 +106,8 @@ async fn on_message(ctx: &Context, msg: &Message) {
 }
 
 /// Someone pasted an API key in a server channel: delete it and warn.
+/// The mention goes in message `content` (embeds don't ping) with an
+/// explicit allowed-mentions scope so the author is actually notified.
 async fn protect_leaked_key(ctx: &Context, msg: &Message) {
     let deleted = ctx
         .http
@@ -110,9 +116,8 @@ async fn protect_leaked_key(ctx: &Context, msg: &Message) {
         .is_ok();
     tracing::warn!(user = %msg.author.id, channel = %msg.channel_id, deleted, "API key posted in a public channel");
     let body = format!(
-        "<@{}> {}\n\nAnyone who saw it can use it — **revoke it now** at https://aistudio.google.com/apikey and create a new one. \
+        "{}\n\nAnyone who saw it can use it — **revoke it now** at https://aistudio.google.com/apikey and create a new one. \
          To add a key safely use `/byok-user` (private form) or `{}byok-user` (DM).",
-        msg.author.id,
         if deleted {
             "I deleted your message because it contained an API key."
         } else {
@@ -120,9 +125,21 @@ async fn protect_leaked_key(ctx: &Context, msg: &Message) {
         },
         ctx.prefix()
     );
-    let _ = ctx
+    let content = format!("<@{}>", msg.author.id);
+    let mentions = twilight_model::channel::message::AllowedMentions {
+        parse: vec![],
+        users: vec![msg.author.id],
+        roles: vec![],
+        replied_user: false,
+    };
+    if let Err(e) = ctx
         .http
         .create_message(msg.channel_id)
+        .content(&content)
         .embeds(&[brand::embed(Tone::Warn, "Secret detected", &body)])
-        .await;
+        .allowed_mentions(Some(&mentions))
+        .await
+    {
+        tracing::warn!(error = %e, channel = %msg.channel_id, "Failed to send leak warning");
+    }
 }

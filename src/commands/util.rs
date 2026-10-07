@@ -118,10 +118,11 @@ pub async fn clear(ctx: &Context, inv: Invocation) {
 
 pub async fn about(ctx: &Context, inv: Invocation) {
     let guilds = ctx.cache.stats().guilds();
+    let tool_count = crate::tools::tool_names().len();
     let body = format!(
         "{}\n\n**Version:** {}\n**Uptime:** {}\n**Servers:** {guilds}\n**Model (default):** `{}`\n\n\
          • Bring your own Gemini key — personal or per-server, stored encrypted\n\
-         • 24 admin tools, always limited to your Discord permissions\n\
+         • {tool_count} admin tools, always limited to your Discord permissions\n\
          • Built in Rust for high concurrency\n\nStart with `{}help`.",
         brand::TAGLINE,
         brand::VERSION,

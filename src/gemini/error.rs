@@ -47,13 +47,14 @@ pub enum GeminiError {
 
 impl GeminiError {
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            GeminiError::RateLimited { .. }
-                | GeminiError::Unavailable { .. }
-                | GeminiError::Timeout
-                | GeminiError::Network(_)
-        )
+        match self {
+            GeminiError::RateLimited { .. } | GeminiError::Timeout | GeminiError::Network(_) => {
+                true
+            }
+            // 501 Not Implemented is permanent — never retry. Other 5xx are transient.
+            GeminiError::Unavailable { status, .. } => !matches!(*status, 501),
+            _ => false,
+        }
     }
 
     /// Errors that mean the key itself is unusable for a while; the key gate
@@ -93,8 +94,10 @@ impl GeminiError {
     }
 
     /// Classify a non-2xx HTTP response. Covers every status the Generative
-    /// Language API emits (400/401/403/404/408/409/413/429/5xx) plus
+    /// Language API emits (400/401/402/403/404/405/408/409/413/429/5xx) plus
     /// rpc `status` / `reason` strings, so no code falls through silently.
+    /// Hint text is generic (no command coupling); Discord-specific guidance
+    /// lives in `crate::error::BotError::hint`.
     pub fn from_response(status: u16, body: &Value, retry_after_header: Option<Duration>) -> Self {
         let err = body.get("error").unwrap_or(&Value::Null);
         let message = err
@@ -120,9 +123,9 @@ impl GeminiError {
         let msg_lc = message.to_lowercase();
 
         let key_invalid = reason == "API_KEY_INVALID"
-            || message.contains("API key not valid")
+            || msg_lc.contains("api key not valid")
             || message.contains("API_KEY_INVALID")
-            || message.contains("API key expired")
+            || msg_lc.contains("api key expired")
             || message.contains("API_KEY_SERVICE_BLOCKED")
             || reason == "API_KEY_SERVICE_BLOCKED"
             || msg_lc.contains("leaked")
@@ -130,28 +133,32 @@ impl GeminiError {
         let service_disabled = reason == "SERVICE_DISABLED"
             || message.contains("SERVICE_DISABLED")
             || message.contains("has not been used in project")
-            || message.contains("is disabled") && message.contains("Enable it")
-            || message.contains("generativelanguage.googleapis.com")
-                && msg_lc.contains("not enabled");
-        let billing = msg_lc.contains("billing")
+            || (message.contains("is disabled") && message.contains("Enable it"))
+            || (message.contains("generativelanguage.googleapis.com")
+                && msg_lc.contains("not enabled"));
+        let billing = msg_lc.contains("billing_not_enabled")
+            || msg_lc.contains("billing_disabled")
+            || msg_lc.contains("billing not enabled")
+            || msg_lc.contains("billing disabled")
             || message.contains("BILLING_NOT_ENABLED")
             || reason == "BILLING_DISABLED"
             || reason == "BILLING_NOT_ENABLED";
-        let region = msg_lc.contains("location")
-            || msg_lc.contains("region")
+        let region = msg_lc.contains("location_policy_violated")
             || msg_lc.contains("not available in your country")
             || msg_lc.contains("unsupported country")
+            || msg_lc.contains("region is not supported")
             || reason == "LOCATION_POLICY_VIOLATED";
         let safety_400 = msg_lc.contains("safety")
-            || msg_lc.contains("blocked") && (msg_lc.contains("harm") || msg_lc.contains("policy"))
-            || rpc_status == "INVALID_ARGUMENT" && msg_lc.contains("prohibited");
+            || (msg_lc.contains("blocked")
+                && (msg_lc.contains("harm") || msg_lc.contains("policy")))
+            || (rpc_status == "INVALID_ARGUMENT" && msg_lc.contains("prohibited"));
         let too_large = msg_lc.contains("too large")
             || msg_lc.contains("max output tokens")
             || msg_lc.contains("context length")
             || msg_lc.contains("token limit")
             || msg_lc.contains("exceeds the maximum")
-            || detail_types.iter().any(|t| t.contains("BadRequest"))
-                && (msg_lc.contains("tokens") || msg_lc.contains("size"));
+            || (detail_types.iter().any(|t| t.contains("BadRequest"))
+                && (msg_lc.contains("tokens") || msg_lc.contains("size")));
 
         match status {
             400 if key_invalid => GeminiError::InvalidKey,
@@ -162,7 +169,7 @@ impl GeminiError {
             400 if too_large => GeminiError::PayloadTooLarge(short),
             400 if rpc_status == "FAILED_PRECONDITION" => GeminiError::Precondition(short),
             400 => GeminiError::BadRequest(if short.is_empty() {
-                "Gemini rejected the request as invalid (HTTP 400). Try `!clear` and rephrase with shorter text.".into()
+                "Gemini rejected the request as invalid (HTTP 400). Reset the conversation and rephrase with shorter text.".into()
             } else {
                 short
             }),
@@ -226,6 +233,14 @@ impl GeminiError {
                     short
                 },
             },
+            501 => GeminiError::BadRequest(format!(
+                "Not implemented (HTTP 501): {}",
+                if short.is_empty() {
+                    "unsupported operation"
+                } else {
+                    &short
+                }
+            )),
             s if s >= 500 => GeminiError::Unavailable {
                 status: s,
                 detail: short,
@@ -270,7 +285,8 @@ fn is_daily_quota(details: &[Value], message: &str) -> bool {
             })
             .unwrap_or(false)
     });
-    in_details || message.contains("per day") || message.contains("PerDay")
+    let msg_lc = message.to_lowercase();
+    in_details || msg_lc.contains("per day") || message.contains("PerDay")
 }
 
 /// Parse `RetryInfo.retryDelay` (e.g. `"17s"` or `"1.5s"`).

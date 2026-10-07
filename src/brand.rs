@@ -12,7 +12,7 @@ pub const COLOR_WARN: u32 = 0xF59E0B;
 pub const COLOR_ERROR: u32 = 0xEF4444;
 pub const COLOR_INFO: u32 = 0x3B82F6;
 
-const TITLE_MAX: usize = 256;
+pub const TITLE_MAX: usize = 256;
 pub const DESCRIPTION_MAX: usize = 4000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,18 +51,37 @@ pub fn footer_text() -> String {
 }
 
 fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    // Single pass: collect up to `max` chars, tracking whether truncated.
+    let mut end = 0;
+    let mut truncated = false;
+    for (count, (i, c)) in s.char_indices().enumerate() {
+        if count >= max {
+            truncated = true;
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    if !truncated && end == s.len() {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    // We collected `max` chars but there is more — replace last char with ….
+    // Re-slice to max-1 chars then push ellipsis to stay within `max`.
+    let kept: String = s.chars().take(max.saturating_sub(1)).collect();
+    let mut out = kept;
     out.push('…');
     out
 }
 
 pub fn builder(tone: Tone, title: &str, description: &str) -> EmbedBuilder {
+    let clipped_title = clip(title, TITLE_MAX.saturating_sub(2));
+    let full_title = if clipped_title.trim().is_empty() {
+        tone.icon().to_string()
+    } else {
+        format!("{} {clipped_title}", tone.icon())
+    };
     let mut b = EmbedBuilder::new()
         .color(tone.color())
-        .title(clip(&format!("{} {title}", tone.icon()), TITLE_MAX))
+        .title(clip(&full_title, TITLE_MAX))
         .footer(EmbedFooterBuilder::new(footer_text()));
     if !description.trim().is_empty() {
         b = b.description(clip(description, DESCRIPTION_MAX));

@@ -101,7 +101,9 @@ impl GeminiClient {
                 });
             }
             drop(entry);
-            self.paused.remove(&fp);
+            // Only remove if the entry is still the expired one — a concurrent
+            // thread may have inserted a fresh (longer) pause meanwhile.
+            self.paused.remove_if(&fp, |_, (u, _)| *u <= Instant::now());
         }
         Ok(())
     }
@@ -120,16 +122,21 @@ impl GeminiClient {
             self.paused.retain(|_, (until, _)| *until > now);
         }
         // Semaphore gates hold no secrets (keyed by u64 hash) but also grow
-        // without bound; cap at a generous size — evicting a live gate only
-        // recreates its semaphore.
+        // without bound. Only evict *idle* gates (all permits available) —
+        // evicting a live gate would recreate a full semaphore and bypass
+        // the per-key RPM limit for in-flight requests.
         if self.gates.len() > 2000 {
-            self.gates.clear();
+            let limit = self.per_key_limit;
+            self.gates.retain(|_, g| g.available_permits() < limit);
+            // If still over cap (all gates live), leave them; growth is
+            // bounded by active keys in that pathological case.
         }
     }
 
     pub async fn generate(&self, p: GenerateParams<'_>) -> Result<Value, GeminiError> {
         self.prune();
         self.check_paused(p.api_key)?;
+        Self::validate_model_name(p.model)?;
         let body = json!({
             "systemInstruction": p.system,
             "contents": p.contents,
@@ -142,9 +149,11 @@ impl GeminiClient {
         let url = format!("{BASE_URL}/models/{}:generateContent", p.model);
 
         let gate = self.gate(p.api_key);
-        let _permit = gate
-            .acquire_owned()
+        // Bound gate wait so a saturated key can't head-of-line block a turn
+        // forever; callers surface this as a retryable timeout.
+        let _permit = tokio::time::timeout(Duration::from_secs(30), gate.acquire_owned())
             .await
+            .map_err(|_| GeminiError::Timeout)?
             .map_err(|_| GeminiError::Network("key gate closed".into()))?;
 
         let result = self.post_with_retry(&url, p.api_key, &body).await;
@@ -179,10 +188,37 @@ impl GeminiClient {
             .map_err(GeminiError::from_reqwest)?;
         let status = resp.status().as_u16();
         if (200..300).contains(&status) {
+            // Drain body to reuse the connection; ignore parse details.
+            let _ = resp.bytes().await;
             return Ok(());
         }
-        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        // Surface parse failures instead of swallowing them as Null.
+        let raw = resp.bytes().await.map_err(GeminiError::from_reqwest)?;
+        let body: Value = serde_json::from_slice(&raw).unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "validate_key non-JSON error body");
+            Value::Null
+        });
         Err(GeminiError::from_response(status, &body, None))
+    }
+
+    fn validate_model_name(model: &str) -> Result<(), GeminiError> {
+        // Model IDs are `[a-z0-9.-]+` optionally with a `models/` prefix.
+        // Reject path traversal / spaces / slashes that would corrupt the URL.
+        let bare = model.strip_prefix("models/").unwrap_or(model);
+        if bare.is_empty() || bare.len() > 128 {
+            return Err(GeminiError::BadRequest(format!(
+                "invalid model name {model:?}"
+            )));
+        }
+        let ok = bare.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.' || c == '_'
+        });
+        if !ok {
+            return Err(GeminiError::BadRequest(format!(
+                "invalid model name {model:?}"
+            )));
+        }
+        Ok(())
     }
 
     async fn post_with_retry(
@@ -247,18 +283,43 @@ impl GeminiClient {
             .headers()
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(Duration::from_secs);
+            .and_then(parse_retry_after);
+        // Cap response bodies (4 MiB) to avoid unbounded memory on abuse.
+        const MAX_BODY: usize = 4 * 1024 * 1024;
+        if let Some(len) = resp.content_length() {
+            if len > MAX_BODY as u64 {
+                return Err(GeminiError::Malformed("response body too large".into()));
+            }
+        }
         let raw = resp.bytes().await.map_err(GeminiError::from_reqwest)?;
+        if raw.len() > MAX_BODY {
+            return Err(GeminiError::Malformed("response body too large".into()));
+        }
         let value: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
         if (200..300).contains(&status) {
-            if value.is_null() {
-                return Err(GeminiError::Malformed("empty or non-JSON body".into()));
+            if !value.is_object() {
+                return Err(GeminiError::Malformed(
+                    "empty or non-object JSON body".into(),
+                ));
             }
             return Ok(value);
         }
         Err(GeminiError::from_response(status, &value, retry_after))
     }
+}
+
+/// Parse `Retry-After` which may be integer seconds or fractional seconds
+/// (e.g. `12`, `12.5`, `17.5s`). Returns None for HTTP-dates (rare from
+/// Gemini) so callers fall back to exponential backoff.
+fn parse_retry_after(s: &str) -> Option<Duration> {
+    let t = s.trim();
+    let numeric = t.strip_suffix('s').unwrap_or(t).trim();
+    if let Ok(secs) = numeric.parse::<f64>() {
+        if secs.is_finite() && secs >= 0.0 {
+            return Some(Duration::from_secs_f64(secs.min(600.0)));
+        }
+    }
+    None
 }
 
 /// Exponential backoff with full jitter; a server-provided delay is a floor.
@@ -285,19 +346,28 @@ fn block_reason(res: &Value) -> Option<String> {
             return Some(format!("prompt blocked ({reason})"));
         }
     }
-    if let Some(candidates) = res.get("candidates").and_then(|c| c.as_array()) {
-        if candidates.is_empty() {
-            return Some("no candidates returned".to_string());
-        }
-        for cand in candidates {
-            if let Some(reason) = cand.get("finishReason").and_then(|r| r.as_str()) {
-                if matches!(
-                    reason,
-                    "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "SPII" | "RECITATION"
-                ) {
-                    return Some(format!("stopped ({reason})"));
-                }
+    let candidates = res.get("candidates").and_then(|c| c.as_array())?;
+    if candidates.is_empty() {
+        // Empty candidates with no promptFeedback block is usually truncation
+        // or an empty model reply — let the caller decide, don't force Blocked.
+        // Only report blocked when promptFeedback says so (handled above).
+        return None;
+    }
+    for cand in candidates {
+        if let Some(reason) = cand.get("finishReason").and_then(|r| r.as_str()) {
+            if matches!(
+                reason,
+                "SAFETY"
+                    | "PROHIBITED_CONTENT"
+                    | "BLOCKLIST"
+                    | "SPII"
+                    | "RECITATION"
+                    | "OTHER"
+                    | "MALFORMED_FUNCTION_CALL"
+            ) {
+                return Some(format!("stopped ({reason})"));
             }
+            // MAX_TOKENS / STOP / etc. are not blocks.
         }
     }
     None

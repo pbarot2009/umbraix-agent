@@ -136,6 +136,9 @@ async fn start(ctx: &Context, inv: Invocation, scope: ByokScope) {
     }
 
     let secs = ctx.config.byok_session_secs;
+    // Sweep expired sessions opportunistically so the map can't leak.
+    let now = Instant::now();
+    ctx.byok_sessions.retain(|_, s| s.expires > now);
     ctx.byok_sessions.insert(
         inv.user_id.get(),
         PendingByok {
@@ -415,26 +418,37 @@ async fn ensure_access_role(
         }
     }
     let name = &ctx.config.allow_agent_role_name;
-    let (role, created) = match snap.find_role_by_name(name) {
-        Some(r) => (r, false),
-        None => {
-            let role = ctx
-                .http
-                .create_role(gid)
-                .name(name)
-                .permissions(Permissions::empty())
-                .mentionable(false)
-                .reason("Umbraix Agent: access role for the server's shared Gemini key")
-                .await?
-                .model()
+    if let Some(r) = snap.find_role_by_name(name) {
+        // Heal config without creating a duplicate.
+        ctx.store
+            .update_guild_config(gid.get(), |c| c.allow_role_id = Some(r.get()))
+            .await?;
+        return Ok((r, false));
+    }
+    // Snapshot may be stale (role created seconds ago) — verify over HTTP
+    // before creating to avoid duplicate same-name roles.
+    if let Ok(fresh) = ctx.http.roles(gid).await?.model().await {
+        if let Some(r) = fresh.iter().find(|r| r.name.eq_ignore_ascii_case(name)) {
+            ctx.store
+                .update_guild_config(gid.get(), |c| c.allow_role_id = Some(r.id.get()))
                 .await?;
-            (role.id, true)
+            return Ok((r.id, false));
         }
-    };
-    ctx.store
-        .update_guild_config(gid.get(), |c| c.allow_role_id = Some(role.get()))
+    }
+    let role = ctx
+        .http
+        .create_role(gid)
+        .name(name)
+        .permissions(Permissions::empty())
+        .mentionable(false)
+        .reason("Umbraix Agent: access role for the server's shared Gemini key")
+        .await?
+        .model()
         .await?;
-    Ok((role, created))
+    ctx.store
+        .update_guild_config(gid.get(), |c| c.allow_role_id = Some(role.id.get()))
+        .await?;
+    Ok((role.id, true))
 }
 
 pub async fn status(ctx: &Context, inv: Invocation) {

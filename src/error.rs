@@ -38,54 +38,79 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for BotError {
 }
 
 /// Classify a raw Discord / twilight error string into a stable code.
+///
+/// Uses explicit Discord JSON error-code matching with word boundaries to
+/// avoid false positives (e.g. an ID containing "429" must not be treated
+/// as rate-limited). Falls back to case-insensitive phrase matching.
 pub fn discord_code(raw: &str) -> &'static str {
-    if raw.contains("50013") || raw.to_lowercase().contains("missing permissions") {
+    let lc = raw.to_lowercase();
+    // Helper: match a numeric Discord API code as a standalone token,
+    // not as a substring of a larger number / snowflake.
+    let has_code = |code: &str| {
+        // Fast path: exact substring must exist at all.
+        if !raw.contains(code) {
+            return false;
+        }
+        // Verify token boundaries around each occurrence.
+        let mut start = 0;
+        while let Some(pos) = raw[start..].find(code) {
+            let s = start + pos;
+            let e = s + code.len();
+            let before_ok = s == 0 || !raw.as_bytes()[s - 1].is_ascii_digit();
+            let after_ok = e == raw.len() || !raw.as_bytes()[e].is_ascii_digit();
+            if before_ok && after_ok {
+                return true;
+            }
+            start = s + 1;
+            if start >= raw.len() {
+                break;
+            }
+        }
+        false
+    };
+
+    if has_code("50013") || lc.contains("missing permissions") {
         "DISCORD_MISSING_PERMISSIONS"
-    } else if raw.contains("50001") || raw.to_lowercase().contains("missing access") {
+    } else if has_code("50001") || lc.contains("missing access") {
         "DISCORD_MISSING_ACCESS"
-    } else if raw.contains("50007") {
+    } else if has_code("50007") {
         "DISCORD_CANNOT_DM"
-    } else if raw.contains("10003") {
+    } else if has_code("10003") {
         "DISCORD_UNKNOWN_CHANNEL"
-    } else if raw.contains("10004") {
+    } else if has_code("10004") {
         "DISCORD_UNKNOWN_GUILD"
-    } else if raw.contains("10007") || raw.contains("10013") {
+    } else if has_code("10007") || has_code("10013") {
         "DISCORD_UNKNOWN_USER"
-    } else if raw.contains("10011") {
+    } else if has_code("10011") {
         "DISCORD_UNKNOWN_ROLE"
-    } else if raw.contains("10008") {
+    } else if has_code("10008") {
         "DISCORD_UNKNOWN_MESSAGE"
-    } else if raw.contains("10062") {
+    } else if has_code("10062") {
         "DISCORD_UNKNOWN_INTERACTION"
-    } else if raw.contains("30001")
-        || raw.contains("30005")
-        || raw.contains("30013")
-        || raw.contains("30016")
-        || raw.to_lowercase().contains("maximum number")
+    } else if has_code("30001")
+        || has_code("30005")
+        || has_code("30013")
+        || has_code("30016")
+        || lc.contains("maximum number")
     {
         "DISCORD_LIMIT_REACHED"
-    } else if raw.contains("50035") {
+    } else if has_code("50035") {
         "DISCORD_INVALID_FORM"
-    } else if raw.contains("50024") {
+    } else if has_code("50024") {
         "DISCORD_WRONG_CHANNEL_TYPE"
-    } else if raw.contains("50028") {
+    } else if has_code("50028") {
         "DISCORD_INVALID_ROLE"
-    } else if raw.contains("429") || raw.to_lowercase().contains("rate limit") {
+    } else if has_code("429") || lc.contains("rate limit") {
         "DISCORD_RATE_LIMITED"
-    } else if raw.contains("401") || raw.to_lowercase().contains("unauthorized") {
+    } else if has_code("401") || lc.contains("unauthorized") {
         "DISCORD_UNAUTHORIZED"
-    } else if raw.contains("403") || raw.to_lowercase().contains("forbidden") {
+    } else if has_code("403") || lc.contains("forbidden") {
         "DISCORD_FORBIDDEN"
-    } else if raw.contains("404") || raw.to_lowercase().contains("not found") {
+    } else if has_code("404") || lc.contains("not found") {
         "DISCORD_NOT_FOUND"
-    } else if raw.contains("500")
-        || raw.contains("502")
-        || raw.contains("503")
-        || raw.contains("504")
-    {
+    } else if has_code("500") || has_code("502") || has_code("503") || has_code("504") {
         "DISCORD_UNAVAILABLE"
-    } else if raw.to_lowercase().contains("hierarchy") || raw.to_lowercase().contains("higher role")
-    {
+    } else if lc.contains("hierarchy") || lc.contains("higher role") {
         "DISCORD_HIERARCHY"
     } else {
         "DISCORD_API"
@@ -144,8 +169,10 @@ pub fn discord_hint(raw: &str) -> String {
 pub fn friendly_tool_error(tool: &str, raw: &str) -> String {
     let code = discord_code(raw);
     let hint = discord_hint(raw);
-    // Keep it short for model context: tool name + code + hint.
-    format!("Failed to execute {tool} [{code}]: {hint}")
+    // Keep it short for model context: tool name + code + hint, capped.
+    let safe_tool: String = tool.chars().take(64).collect();
+    let msg = format!("Failed to execute {safe_tool} [{code}]: {hint}");
+    crate::utils::truncate_chars(&msg, 800)
 }
 
 impl BotError {
@@ -165,9 +192,7 @@ impl BotError {
         match self {
             BotError::Gemini(e) => matches!(
                 e,
-                GeminiError::Malformed(_)
-                    | GeminiError::BadRequest(_)
-                    | GeminiError::PayloadTooLarge(_)
+                GeminiError::PayloadTooLarge(_)
                     | GeminiError::Unavailable { .. }
                     | GeminiError::ServiceDisabled(_)
             ),
@@ -180,9 +205,6 @@ impl BotError {
             ),
             BotError::Store(_) | BotError::Internal(_) => true,
             BotError::Timeout(_) | BotError::User(_) => false,
-            // User-fixable Gemini states (bad key, quota, perms, region)
-            // are NOT operator alerts.
-            BotError::Gemini(_) => false,
         }
     }
 
@@ -211,11 +233,19 @@ impl BotError {
                 "DISCORD_MISSING_ACCESS" => "I can't access that channel",
                 "DISCORD_CANNOT_DM" => "Can't send a DM",
                 "DISCORD_UNKNOWN_CHANNEL" => "Channel not found",
+                "DISCORD_UNKNOWN_GUILD" => "Server not found",
                 "DISCORD_UNKNOWN_USER" => "User not found",
                 "DISCORD_UNKNOWN_ROLE" => "Role not found",
                 "DISCORD_UNKNOWN_MESSAGE" => "Message not found",
+                "DISCORD_UNKNOWN_INTERACTION" => "Interaction expired",
                 "DISCORD_LIMIT_REACHED" => "Discord server limit reached",
                 "DISCORD_INVALID_FORM" => "Discord rejected the values",
+                "DISCORD_WRONG_CHANNEL_TYPE" => "Wrong channel type",
+                "DISCORD_INVALID_ROLE" => "Invalid role",
+                "DISCORD_HIERARCHY" => "Role hierarchy blocks this",
+                "DISCORD_FORBIDDEN" => "Discord forbids this",
+                "DISCORD_NOT_FOUND" => "Not found on Discord",
+                "DISCORD_UNAUTHORIZED" => "Discord token invalid",
                 "DISCORD_RATE_LIMITED" => "Discord is rate limiting me",
                 "DISCORD_UNAVAILABLE" => "Discord is having trouble",
                 _ => "Discord rejected an action",

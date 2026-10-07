@@ -18,9 +18,15 @@ use crate::{
 };
 
 /// No pings from bot output unless explicitly intended — model text can
-/// never mass-mention.
+/// never mass-mention. Built explicitly so an upstream default change can't
+/// re-enable pings.
 pub fn no_mentions() -> AllowedMentions {
-    AllowedMentions::default()
+    AllowedMentions {
+        parse: vec![],
+        users: vec![],
+        roles: vec![],
+        replied_user: false,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -246,16 +252,49 @@ impl Responder {
                     Err(e) => {
                         // Interaction tokens expire after 15 minutes; long
                         // agent runs fall back to a plain channel message.
-                        let Some(ch) = channel_id.filter(|_| *state != State::Fresh) else {
+                        // Fresh-state failures are usually "Unknown interaction"
+                        // (3s window expired) — also fall back when the error
+                        // looks like expiry, otherwise surface it.
+                        let err_str = e.to_string();
+                        let expired = err_str.contains("10062")
+                            || err_str.to_lowercase().contains("unknown interaction")
+                            || err_str.to_lowercase().contains("expired");
+                        let fallback_ch = if *state == State::Fresh {
+                            if expired {
+                                *channel_id
+                            } else {
+                                None
+                            }
+                        } else {
+                            *channel_id
+                        };
+                        let Some(ch) = fallback_ch else {
                             return Err(e);
                         };
                         tracing::warn!(error = %e, "Interaction reply failed, falling back to channel message");
+                        let note_ephemeral = if ephemeral {
+                            "_(this was meant to be private, but the interaction expired so I'm posting publicly)_\n"
+                        } else {
+                            ""
+                        };
+                        let mut fallback_embeds = embeds.clone();
+                        if !note_ephemeral.is_empty() {
+                            // Prepend downgrade notice to first embed description.
+                            if let Some(first) = fallback_embeds.first() {
+                                let mut f = first.clone();
+                                let desc = f.description.clone().unwrap_or_default();
+                                f.description = Some(format!("{note_ephemeral}{desc}"));
+                                fallback_embeds[0] = f;
+                            }
+                        }
+                        // Scrub embeds (defence-in-depth; errors may echo IDs).
                         ctx.http
                             .create_message(ch)
-                            .embeds(&embeds)
+                            .embeds(&fallback_embeds)
                             .components(&components)
                             .allowed_mentions(Some(&mentions))
                             .await?;
+                        *state = State::Responded;
                         Ok(())
                     }
                 }
@@ -306,16 +345,25 @@ pub async fn report_to_operator(ctx: &Context, reference: &str, request_id: &str
     let Some(ch) = ctx.config.error_log_channel_id else {
         return;
     };
+    let Some(ch_id) = Id::new_checked(ch) else {
+        tracing::warn!(
+            channel = ch,
+            "ERROR_LOG_CHANNEL_ID is zero/invalid, skipping operator report"
+        );
+        return;
+    };
+    // Scrub before posting: downstream errors may echo request content.
+    let (scrubbed, _) = utils::scrub_google_keys(&err.to_string());
     let body = format!(
         "**code** `{}`\n**request** `{request_id}`\n```\n{}\n```",
         err.code(),
-        utils::truncate_chars(&err.to_string(), 1500)
+        utils::truncate_chars(&scrubbed, 1500)
     );
     let embed = brand::embed(Tone::Error, &format!("Error {reference}"), &body);
     let mentions = no_mentions();
     if let Err(e) = ctx
         .http
-        .create_message(Id::new(ch))
+        .create_message(ch_id)
         .embeds(&[embed])
         .allowed_mentions(Some(&mentions))
         .await
@@ -349,10 +397,14 @@ pub async fn dm(
 
 /// Post a line to a guild's configured log channel (audit of agent actions).
 pub async fn guild_log(ctx: &Context, channel_id: u64, embed: Embed) {
+    let Some(ch_id) = Id::new_checked(channel_id) else {
+        tracing::warn!(channel_id, "guild log channel id is zero/invalid, skipping");
+        return;
+    };
     let mentions = no_mentions();
     if let Err(e) = ctx
         .http
-        .create_message(Id::new(channel_id))
+        .create_message(ch_id)
         .embeds(&[embed])
         .allowed_mentions(Some(&mentions))
         .await

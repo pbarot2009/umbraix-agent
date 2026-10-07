@@ -72,7 +72,21 @@ pub struct ApiKey(Arc<str>);
 
 impl ApiKey {
     pub fn new(key: impl Into<Arc<str>>) -> Self {
-        Self(key.into())
+        let arc: Arc<str> = key.into();
+        // Fail fast on empty keys in debug; production callers should use
+        // `try_new` for a proper error. Stored keys are validated in
+        // `Store::set_key`.
+        debug_assert!(!arc.trim().is_empty(), "ApiKey must not be empty");
+        Self(arc)
+    }
+
+    /// Validated constructor: rejects empty/whitespace keys.
+    pub fn try_new(key: impl Into<Arc<str>>) -> Result<Self, String> {
+        let arc: Arc<str> = key.into();
+        if arc.trim().is_empty() {
+            return Err("API key must not be empty".into());
+        }
+        Ok(Self(arc))
     }
 
     pub fn expose(&self) -> &str {
@@ -92,11 +106,21 @@ impl ApiKey {
     }
 
     /// Stable in-process fingerprint used for per-key concurrency limits.
+    /// Deterministic FNV-1a 64-bit over the key bytes: same key always maps
+    /// to the same gate/pause entry within and across runs. (Fairness only —
+    /// not a cryptographic identifier; collisions only merge rate limits.)
     pub fn fingerprint(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        self.0.hash(&mut h);
-        h.finish()
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+        let mut h = FNV_OFFSET;
+        for b in self.0.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        // Mix in length to separate prefixes from full keys.
+        h ^= self.0.len() as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+        h
     }
 }
 

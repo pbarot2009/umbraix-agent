@@ -246,7 +246,7 @@ pub async fn list_role_members(
     let names: std::collections::HashMap<_, _> =
         roles.iter().map(|r| (r.id.get(), r.name.clone())).collect();
     let mut entries: Vec<(u64, u64)> = counts.into_iter().map(|(id, c)| (id.get(), c)).collect();
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|a| std::cmp::Reverse(a.1));
     if entries.is_empty() {
         return Ok("No role member counts returned.".to_string());
     }

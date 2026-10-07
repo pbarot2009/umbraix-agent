@@ -342,11 +342,17 @@ pub async fn set_nickname(
     discord: &DiscordHttp,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let user_id = parse_user_id(args, "user_id").map_err(|e| format!("set_nickname: {e}"))?;
-    let nickname = get_str(args, "nickname", "");
+    // Missing key = error (don't clear); explicit "" clears. "none"/"clear"/
+    // "reset" only clear when they are clearly commands, not legit nicks —
+    // require the field to be exactly that word AND short? Keep simple: only
+    // empty string clears; the words are treated as literal nicks to avoid
+    // clobbering a user named "None".
+    let Some(nick_val) = args.get("nickname") else {
+        return Err("set_nickname: 'nickname' is required (pass empty string to clear).".into());
+    };
+    let nickname = nick_val.as_str().unwrap_or("");
     let reason = get_str(args, "reason", "");
-    let lowered = nickname.to_lowercase();
-    let clear =
-        nickname.is_empty() || lowered == "clear" || lowered == "reset" || lowered == "none";
+    let clear = nickname.is_empty();
     if !clear && (nickname.chars().count() > 32) {
         return Err("set_nickname: 'nickname' must be at most 32 characters.".into());
     }
@@ -409,7 +415,10 @@ pub async fn set_topic(
     if !has_topic {
         return Err("set_topic: 'topic' is required (pass empty string to clear).".into());
     }
-    let topic = args["topic"].as_str().unwrap_or_default();
+    // Present-but-non-string (e.g. number) is a model error, not a clear.
+    let Some(topic) = args["topic"].as_str() else {
+        return Err("set_topic: 'topic' must be a string (pass empty string to clear).".into());
+    };
     if topic.chars().count() > 1024 {
         return Err("set_topic: 'topic' must be at most 1024 characters.".into());
     }

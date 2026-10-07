@@ -256,7 +256,7 @@ impl ToolGuard {
             // set_role_permissions replaces the whole bitset: the requester may
             // not grant permissions they don't hold themselves.
             if tool == "set_role_permissions" && !auth.bypass && !auth.is_guild_owner {
-                if let Some(bits) = args.get("permissions").and_then(|v| v.as_u64()) {
+                if let Some(bits) = super::helpers::parse_permission_bits(args, "permissions") {
                     if let Some(wanted) = Permissions::from_bits(bits) {
                         if !auth.permissions.contains(wanted) {
                             return deny(format!(

@@ -111,7 +111,18 @@ impl Context {
 
     pub fn is_shutting_down(&self) -> bool {
         self.shutting_down
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_shutting_down(&self) {
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Record IDs from the first Ready event; idempotent across shards.
+    pub fn init_ids(&self, app_id: Id<ApplicationMarker>, bot_user_id: Id<UserMarker>) {
+        let _ = self.app_id.set(app_id);
+        let _ = self.bot_user_id.set(bot_user_id);
     }
 
     pub fn prefix(&self) -> &str {

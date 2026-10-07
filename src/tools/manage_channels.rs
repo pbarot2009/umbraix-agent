@@ -10,7 +10,9 @@ use twilight_model::{
     },
 };
 
-use super::helpers::{clamp_int_arg, get_str, parse_channel_id, parse_role_id, parse_user_id};
+use super::helpers::{
+    clamp_int_arg, get_str, parse_channel_id, parse_permission_bits, parse_role_id, parse_user_id,
+};
 
 // ---------------------------------------------------------------------------
 // Schemas
@@ -367,14 +369,10 @@ fn parse_overwrite_target(
         _ => return Err("target_type must be 'role' or 'member'.".to_string()),
     };
     let raw = args.get("target_id").cloned().unwrap_or(Value::Null);
-    let probe = serde_json::json!({ "target_id": raw });
+    let _ = raw;
     let id: Id<GenericMarker> = match kind {
-        PermissionOverwriteType::Role => parse_role_id(&probe, "target_id")
-            .map(|r| r.cast())
-            .map_err(|e| e)?,
-        PermissionOverwriteType::Member => parse_user_id(&probe, "target_id")
-            .map(|u| u.cast())
-            .map_err(|e| e)?,
+        PermissionOverwriteType::Role => parse_role_id(args, "target_id").map(|r| r.cast())?,
+        PermissionOverwriteType::Member => parse_user_id(args, "target_id").map(|u| u.cast())?,
         _ => return Err("target_type must be 'role' or 'member'.".to_string()),
     };
     Ok((id, kind))
@@ -390,8 +388,8 @@ pub async fn set_channel_permissions(
         .map_err(|e| format!("set_channel_permissions: {e}"))?;
     let (target, kind) =
         parse_overwrite_target(args).map_err(|e| format!("set_channel_permissions: {e}"))?;
-    let allow_bits = args.get("allow").and_then(|v| v.as_u64()).unwrap_or(0);
-    let deny_bits = args.get("deny").and_then(|v| v.as_u64()).unwrap_or(0);
+    let allow_bits = parse_permission_bits(args, "allow").unwrap_or(0);
+    let deny_bits = parse_permission_bits(args, "deny").unwrap_or(0);
     if allow_bits == 0 && deny_bits == 0 {
         return Err(
             "set_channel_permissions: provide nonzero 'allow' and/or 'deny' bit integers.".into(),
@@ -429,17 +427,15 @@ pub async fn clear_channel_permissions(
     let channel_id = parse_channel_id(args, "channel_id")
         .map_err(|e| format!("clear_channel_permissions: {e}"))?;
     let kind_str = get_str(args, "target_type", "").to_lowercase();
-    let probe =
-        serde_json::json!({ "target_id": args.get("target_id").cloned().unwrap_or(Value::Null) });
     let req = discord.delete_channel_permission(channel_id);
     match kind_str.as_str() {
         "role" => {
-            let role_id = parse_role_id(&probe, "target_id")
+            let role_id = parse_role_id(args, "target_id")
                 .map_err(|e| format!("clear_channel_permissions: {e}"))?;
             req.role(role_id).await?;
         }
         "member" => {
-            let user_id = parse_user_id(&probe, "target_id")
+            let user_id = parse_user_id(args, "target_id")
                 .map_err(|e| format!("clear_channel_permissions: {e}"))?;
             req.member(user_id).await?;
         }

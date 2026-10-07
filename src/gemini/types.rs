@@ -24,9 +24,18 @@ pub fn extract_function_calls(content: &Value) -> Vec<(String, Value)> {
                     .and_then(|n| n.as_str())
                     .unwrap_or_default();
                 if name.is_empty() {
+                    tracing::warn!("Gemini returned nameless functionCall, skipping");
                     continue;
                 }
                 let args = call.get("args").cloned().unwrap_or(Value::Null);
+                // Tool executors expect object args; coerce anything else to
+                // Null with a warning instead of forwarding garbage.
+                let args = if args.is_object() || args.is_null() {
+                    args
+                } else {
+                    tracing::warn!(tool = %name, "non-object args coerced to null");
+                    Value::Null
+                };
                 out.push((name.to_string(), args));
             }
         }
@@ -35,13 +44,30 @@ pub fn extract_function_calls(content: &Value) -> Vec<(String, Value)> {
 }
 
 /// Extract the first `text` part, if any.
+/// NOTE: with `candidateCount=1` the model returns a single candidate and
+/// text normally precedes tool calls; multi-part text is concatenated by
+/// [`extract_all_text`].
 pub fn extract_text(content: &Value) -> Option<String> {
-    content
-        .get("parts")?
-        .as_array()?
-        .iter()
-        .find_map(|p| p.get("text")?.as_str())
-        .map(|s| s.to_string())
+    extract_all_text(content)
+}
+
+/// Concatenate ALL text parts in a content object.
+pub fn extract_all_text(content: &Value) -> Option<String> {
+    let parts = content.get("parts")?.as_array()?;
+    let mut out = String::new();
+    for p in parts {
+        if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(t);
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// Extract text from a full response (`candidates[0].content.parts[0].text`).

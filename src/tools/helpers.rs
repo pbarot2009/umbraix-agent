@@ -38,23 +38,50 @@ fn raw_snowflake(args: &Value, field: &str) -> Result<String, String> {
 pub fn parse_channel_id(args: &Value, field: &str) -> Result<Id<ChannelMarker>, String> {
     let raw = raw_snowflake(args, field)?;
     let raw = raw.trim();
-    // Accept `<#123>` channel mentions as well as raw snowflakes.
-    let digits = raw.trim_start_matches("<#").trim_end_matches('>').trim();
+    // Strict: `<#123>` must be balanced; bare `123>>>` / `<#123` rejected.
+    let digits = if raw.starts_with("<#") {
+        if !(raw.ends_with('>') && raw.len() > 3) {
+            return Err(format!("Invalid channel ID '{raw}'."));
+        }
+        raw[2..raw.len() - 1].trim()
+    } else {
+        if raw.contains(['<', '>', '#', '@', '&', '!']) {
+            return Err(format!("Invalid channel ID '{raw}'."));
+        }
+        raw
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("Invalid channel ID '{raw}'."));
+    }
     Id::<ChannelMarker>::from_str(digits).map_err(|_| format!("Invalid channel ID '{raw}'."))
 }
 
 pub fn parse_user_id(args: &Value, field: &str) -> Result<Id<UserMarker>, String> {
     let raw = raw_snowflake(args, field)?;
     let raw = raw.trim();
-    // Accept raw snowflakes and `<@123>` / `<@!123>` mentions.
-    let digits = raw
-        .trim_start_matches("<@")
-        .trim_start_matches('!')
-        .trim_end_matches('>');
-    // Guard: a role mention `<@&123>` passed where a user was expected.
-    let digits = digits.trim_start_matches('&');
-    if digits.is_empty() {
-        return Err(format!("Missing required field '{field}'."));
+    // Reject role mentions outright — `<@&123>` is never a user.
+    if raw.contains('&') {
+        return Err(format!(
+            "Invalid user ID '{raw}' (role mention passed as user)."
+        ));
+    }
+    let digits = if raw.starts_with("<@") {
+        if !raw.ends_with('>') {
+            return Err(format!("Invalid user ID '{raw}'."));
+        }
+        let inner = raw[2..raw.len() - 1].trim().trim_start_matches('!');
+        if inner.is_empty() {
+            return Err(format!("Missing required field '{field}'."));
+        }
+        inner
+    } else {
+        if raw.contains(['<', '>', '#', '@', '!']) {
+            return Err(format!("Invalid user ID '{raw}'."));
+        }
+        raw
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("Invalid user ID '{raw}'."));
     }
     Id::<UserMarker>::from_str(digits).map_err(|_| format!("Invalid user ID '{raw}'."))
 }
@@ -62,11 +89,19 @@ pub fn parse_user_id(args: &Value, field: &str) -> Result<Id<UserMarker>, String
 pub fn parse_role_id(args: &Value, field: &str) -> Result<Id<RoleMarker>, String> {
     let raw = raw_snowflake(args, field)?;
     let raw = raw.trim();
-    // Accept raw snowflakes and `<@&123>` role mentions.
-    let digits = raw.trim_start_matches("<@&").trim_end_matches('>');
-    let digits = digits.trim();
-    if digits.is_empty() {
-        return Err(format!("Missing required field '{field}'."));
+    let digits = if raw.starts_with("<@&") {
+        if !raw.ends_with('>') {
+            return Err(format!("Invalid role ID '{raw}'."));
+        }
+        raw[3..raw.len() - 1].trim()
+    } else {
+        if raw.contains(['<', '>', '#', '@', '&', '!']) {
+            return Err(format!("Invalid role ID '{raw}'."));
+        }
+        raw
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("Invalid role ID '{raw}'."));
     }
     Id::<RoleMarker>::from_str(digits).map_err(|_| format!("Invalid role ID '{raw}'."))
 }
@@ -82,6 +117,22 @@ pub fn parse_guild_id(args: &Value, field: &str) -> Result<Id<GuildMarker>, Stri
 
 pub fn get_str<'a>(args: &'a Value, field: &str, default: &'a str) -> &'a str {
     args[field].as_str().unwrap_or(default).trim()
+}
+
+/// Parse permission bits accepting u64, i64, or numeric strings.
+/// Used everywhere permission bitsets arrive from the model, so a string
+/// `"8"` can't bypass privilege checks that only looked at `as_u64()`.
+pub fn parse_permission_bits(args: &Value, field: &str) -> Option<u64> {
+    if let Some(n) = args[field].as_u64() {
+        return Some(n);
+    }
+    if let Some(n) = args[field].as_i64() {
+        return u64::try_from(n).ok();
+    }
+    if let Some(s) = args[field].as_str() {
+        return s.trim().parse::<u64>().ok();
+    }
+    None
 }
 
 /// Clamp a requested purge count into Discord's 1..=100 window.

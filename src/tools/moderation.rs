@@ -236,8 +236,19 @@ pub async fn timeout(
     discord: &DiscordHttp,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let user_id = parse_user_id(args, "user_id").map_err(|e| format!("timeout_member: {e}"))?;
-    let minutes = clamp_int_arg(args, "minutes", 10, 1, 40_320);
-    let reason = get_str(args, "reason", "");
+    // Strict: present-but-invalid minutes is a model error, not a silent 10.
+    let minutes_raw = args.get("minutes").and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_str()?.trim().parse::<u64>().ok())
+            .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
+    });
+    let Some(minutes) = minutes_raw else {
+        return Err("timeout_member: 'minutes' must be an integer 1-40320.".into());
+    };
+    if !(1..=40_320).contains(&minutes) {
+        return Err("timeout_member: 'minutes' must be 1-40320 (28d max).".into());
+    }
+    let reason = crate::utils::truncate_chars(get_str(args, "reason", ""), 512);
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -252,7 +263,7 @@ pub async fn timeout(
     if reason.is_empty() {
         request.await?;
     } else {
-        request.reason(reason).await?;
+        request.reason(&reason).await?;
     }
 
     Ok(format!(

@@ -70,6 +70,15 @@ pub async fn run(ctx: &Context, inv: Invocation, args: String) {
         return;
     }
     let (Some(guild_id), Some(channel_id)) = (inv.guild_id, inv.channel_id) else {
+        inv.responder
+            .info(
+                ctx,
+                crate::brand::Tone::Warn,
+                "Server only",
+                "AI turns run in servers — DMs are reserved for key setup (`byok-user`).",
+                true,
+            )
+            .await;
         return;
     };
     let user = inv.user_id.get();

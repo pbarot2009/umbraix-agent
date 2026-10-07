@@ -9,13 +9,23 @@ use umbraix_agent::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    dotenvy::dotenv().ok();
+    if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
+        eprintln!("rustls default provider install failed (already installed?): {e:?}");
+    }
+    if let Err(e) = dotenvy::dotenv() {
+        // Missing .env is fine (env may come from shell); malformed is not.
+        if e.not_found() {
+            tracing::debug!(".env not found, using process environment");
+        } else {
+            eprintln!("warning: failed to parse .env: {e}");
+        }
+    }
     let _log_guard = logging::init();
 
     if let Err(e) = run().await {
+        // Log once here; return Ok to avoid double-reporting via Debug print.
         tracing::error!(error = %e, "{} failed to start", brand::NAME);
-        return Err(e);
+        std::process::exit(1);
     }
     Ok(())
 }

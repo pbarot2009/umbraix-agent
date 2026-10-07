@@ -30,10 +30,20 @@ fn strip_mention(v: &str) -> &str {
 }
 
 pub fn valid_model_name(v: &str) -> bool {
-    !v.is_empty()
-        && v.len() <= 64
-        && v.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+    // Accept optional `models/` prefix (Gemini API style) and standard IDs.
+    // Reject path traversal, spaces, and empty segments.
+    let bare = v.strip_prefix("models/").unwrap_or(v);
+    if bare.is_empty() || bare.len() > 128 {
+        return false;
+    }
+    if bare.contains("..") || bare.contains("//") || bare.contains(' ') {
+        return false;
+    }
+    if bare.starts_with('/') || bare.ends_with('/') || bare.starts_with('.') {
+        return false;
+    }
+    bare.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '/'))
 }
 
 async fn render(ctx: &Context, gid: u64, cfg: &GuildConfig) -> String {

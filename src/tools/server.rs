@@ -315,16 +315,31 @@ pub async fn edit_server(
         changed.push(format!("name='{name}'"));
     }
     if let Some(v) = args.get("afk_channel_id") {
-        let s = v.as_str().unwrap_or("").trim();
-        if s.is_empty() {
-            req = req.afk_channel_id(None);
-            changed.push("afk_channel=cleared".to_string());
-        } else {
+        // Numeric IDs must set, not clear: only explicit ""/null clears.
+        if v.is_null() {
+            // null = no-op (leave unchanged), not clear.
+        } else if let Some(s) = v.as_str() {
+            let s = s.trim();
+            if s.is_empty() {
+                req = req.afk_channel_id(None);
+                changed.push("afk_channel=cleared".to_string());
+            } else {
+                let probe = json!({ "channel_id": v });
+                let ch = super::helpers::parse_channel_id(&probe, "channel_id")
+                    .map_err(|e| format!("edit_server: bad afk_channel_id: {e}"))?;
+                req = req.afk_channel_id(Some(ch));
+                changed.push(format!("afk_channel=<#{ch}>"));
+            }
+        } else if v.as_u64().is_some() || v.as_i64().is_some() {
             let probe = json!({ "channel_id": v });
             let ch = super::helpers::parse_channel_id(&probe, "channel_id")
                 .map_err(|e| format!("edit_server: bad afk_channel_id: {e}"))?;
             req = req.afk_channel_id(Some(ch));
             changed.push(format!("afk_channel=<#{ch}>"));
+        } else {
+            return Err(
+                "edit_server: bad afk_channel_id: must be a channel ID or empty string.".into(),
+            );
         }
     }
     if args.get("afk_timeout").is_some() {
@@ -338,16 +353,30 @@ pub async fn edit_server(
         changed.push(format!("afk_timeout={t}s"));
     }
     if let Some(v) = args.get("system_channel_id") {
-        let s = v.as_str().unwrap_or("").trim();
-        if s.is_empty() {
-            req = req.system_channel(None);
-            changed.push("system_channel=cleared".to_string());
-        } else {
+        if v.is_null() {
+            // null = no-op.
+        } else if let Some(s) = v.as_str() {
+            let s = s.trim();
+            if s.is_empty() {
+                req = req.system_channel(None);
+                changed.push("system_channel=cleared".to_string());
+            } else {
+                let probe = json!({ "channel_id": v });
+                let ch = super::helpers::parse_channel_id(&probe, "channel_id")
+                    .map_err(|e| format!("edit_server: bad system_channel_id: {e}"))?;
+                req = req.system_channel(Some(ch));
+                changed.push(format!("system_channel=<#{ch}>"));
+            }
+        } else if v.as_u64().is_some() || v.as_i64().is_some() {
             let probe = json!({ "channel_id": v });
             let ch = super::helpers::parse_channel_id(&probe, "channel_id")
                 .map_err(|e| format!("edit_server: bad system_channel_id: {e}"))?;
             req = req.system_channel(Some(ch));
             changed.push(format!("system_channel=<#{ch}>"));
+        } else {
+            return Err(
+                "edit_server: bad system_channel_id: must be a channel ID or empty string.".into(),
+            );
         }
     }
     if let Some(v) = args.get("rules_channel_id") {
@@ -573,12 +602,41 @@ pub async fn delete_invite(
     if code.is_empty() {
         return Err("delete_invite: 'code' is required (the part after discord.gg/).".into());
     }
-    let code = code
-        .trim()
-        .trim_start_matches("https://discord.gg/")
-        .trim_start_matches("discord.gg/");
-    discord.delete_invite(code).await?;
-    Ok(format!("Revoked invite discord.gg/{code}"))
+    // Accept full URLs, bare codes, trailing slashes and query strings.
+    let mut c = code.trim();
+    // Strip scheme + host variants.
+    for prefix in [
+        "https://discord.gg/",
+        "http://discord.gg/",
+        "https://www.discord.gg/",
+        "http://www.discord.gg/",
+        "discord.gg/",
+        "www.discord.gg/",
+    ] {
+        if let Some(rest) = c.strip_prefix(prefix) {
+            c = rest;
+            break;
+        }
+    }
+    // Also handle discord.com/invite/ URLs.
+    for prefix in [
+        "https://discord.com/invite/",
+        "http://discord.com/invite/",
+        "discord.com/invite/",
+    ] {
+        if let Some(rest) = c.strip_prefix(prefix) {
+            c = rest;
+            break;
+        }
+    }
+    // Take last non-empty path segment, drop query/fragment.
+    let c = c.split(['?', '#']).next().unwrap_or(c);
+    let c = c.trim_matches('/').rsplit('/').next().unwrap_or(c).trim();
+    if c.is_empty() {
+        return Err("delete_invite: could not parse invite code.".into());
+    }
+    discord.delete_invite(c).await?;
+    Ok(format!("Revoked invite discord.gg/{c}"))
 }
 
 pub async fn list_webhooks(

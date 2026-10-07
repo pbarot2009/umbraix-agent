@@ -84,8 +84,12 @@ impl Denied {
                     ));
                 }
                 if *server_has_key {
+                    // role_id may be stale (role deleted). Callers pass the
+                    // snapshot when available; here we can only render — if the
+                    // ID is provided we mention it, otherwise fall back to name
+                    // so we never render a dangling mention.
                     let role = role_id
-                        .map(|r| format!("<@&{r}>"))
+                        .map(|r| format!("<@&{r}> (`{role_name}`)"))
                         .unwrap_or_else(|| format!("`{role_name}`"));
                     lines.push(format!("• **Ask for the {role} role** — this server provides a shared key for members with it."));
                 } else {
@@ -143,17 +147,35 @@ impl GuildSnapshot {
         }
         if roles.is_empty() || !roles.contains_key(&guild_id.cast()) {
             tracing::debug!(guild = %guild_id, "Role cache miss, fetching roles over HTTP");
-            roles.clear();
-            for r in ctx.http.roles(guild_id).await?.model().await? {
-                roles.insert(
-                    r.id,
-                    RoleInfo {
-                        name: r.name,
-                        position: r.position,
-                        permissions: r.permissions,
-                        managed: r.managed,
-                    },
-                );
+            match ctx.http.roles(guild_id).await {
+                Ok(resp) => match resp.model().await {
+                    Ok(fresh) => {
+                        roles.clear();
+                        for r in fresh {
+                            roles.insert(
+                                r.id,
+                                RoleInfo {
+                                    name: r.name,
+                                    position: r.position,
+                                    permissions: r.permissions,
+                                    managed: r.managed,
+                                },
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(guild = %guild_id, error = %e, "roles decode failed, keeping cached roles");
+                        if roles.is_empty() {
+                            return Err(e.into());
+                        }
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(guild = %guild_id, error = %e, "roles fetch failed, keeping cached roles");
+                    if roles.is_empty() {
+                        return Err(e.into());
+                    }
+                }
             }
         } else {
             // Cache had *something* but may still be stale (role created /
@@ -172,11 +194,14 @@ impl GuildSnapshot {
 
     /// Re-fetch roles + owner over HTTP and replace the cached view.
     /// Call when a role lookup fails — the in-memory cache may be stale.
+    /// Fetches both resources before mutating, so a failure leaves the
+    /// snapshot consistent (no half-updated owner + stale roles).
     pub async fn refresh(&mut self, ctx: &Context) -> Result<(), BotError> {
         let guild = ctx.http.guild(self.guild_id).await?.model().await?;
+        let fresh_roles = ctx.http.roles(self.guild_id).await?.model().await?;
         self.owner_id = guild.owner_id;
         let mut roles = HashMap::new();
-        for r in ctx.http.roles(self.guild_id).await?.model().await? {
+        for r in fresh_roles {
             roles.insert(
                 r.id,
                 RoleInfo {
@@ -207,11 +232,19 @@ impl GuildSnapshot {
     }
 
     pub fn top_position(&self, member_roles: &[Id<RoleMarker>]) -> i64 {
+        // @everyone position is the floor (usually 0). If it's missing from
+        // the snapshot, fall back to 0 rather than under-ranking.
+        let everyone_pos = self
+            .roles
+            .get(&self.guild_id.cast())
+            .map(|r| r.position)
+            .unwrap_or(0);
         member_roles
             .iter()
             .filter_map(|r| self.roles.get(r).map(|i| i.position))
             .max()
-            .unwrap_or(0)
+            .map(|m| m.max(everyone_pos))
+            .unwrap_or(everyone_pos)
     }
 
     pub fn permissions(
@@ -354,6 +387,11 @@ pub fn effective_allow_role(
 /// it is used to auto-heal a stale `allow_role_id` (role deleted +
 /// recreated) and to recompute guild ownership authoritatively instead of
 /// trusting a possibly-stale boolean.
+///
+/// NOTE on `member_roles`: the caller MUST pass authoritative roles —
+/// prefer [`fresh_member_roles`] (HTTP) over the gateway payload, which can
+/// be stale/empty and causes false-denies. `resolve_with_snapshot` trusts
+/// what it is given for the `has_role` check.
 pub async fn resolve(
     ctx: &Context,
     user_id: u64,
@@ -429,12 +467,15 @@ pub async fn resolve_with_snapshot(
                 let gid_u64 = gid.get();
                 let ctx_clone = ctx.clone();
                 tokio::spawn(async move {
-                    let _ = ctx_clone
+                    if let Err(e) = ctx_clone
                         .store
                         .update_guild_config(gid_u64, |cfg| {
                             cfg.allow_role_id = Some(healed_id);
                         })
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(guild = gid_u64, healed_role = healed_id, error = %e, "failed to persist healed allow_role_id");
+                    }
                 });
                 tracing::info!(guild = %gid, healed_role = healed_id, "Auto-healed stale allow_role_id");
             }

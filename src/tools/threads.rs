@@ -5,7 +5,7 @@ use twilight_model::{
     id::{marker::GuildMarker, Id},
 };
 
-use super::helpers::{clamp_int_arg, get_str, parse_channel_id, parse_user_id, truncate_output};
+use super::helpers::{get_str, parse_channel_id, parse_user_id, truncate_output};
 
 // ---------------------------------------------------------------------------
 // Schemas
@@ -167,18 +167,28 @@ pub async fn create_thread(
     let channel_id =
         parse_channel_id(args, "channel_id").map_err(|e| format!("create_thread: {e}"))?;
     let name = get_str(args, "name", "");
-    if name.is_empty() || name.len() > 100 {
+    if name.is_empty() || name.chars().count() > 100 {
         return Err("create_thread: 'name' must be 1-100 characters.".into());
     }
     let kind = match get_str(args, "kind", "public").to_lowercase().as_str() {
         "private" => ChannelType::PrivateThread,
         _ => ChannelType::PublicThread,
     };
-    let auto_archive = match clamp_int_arg(args, "auto_archive_minutes", 1440, 60, 10080) {
+    // Strict: must be exactly one of Discord's allowed values.
+    let raw_archive = args
+        .get("auto_archive_minutes")
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str()?.trim().parse::<u64>().ok())
+                .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
+        })
+        .unwrap_or(1440);
+    let auto_archive = match raw_archive {
         60 => AutoArchiveDuration::Hour,
+        1440 => AutoArchiveDuration::Day,
         4320 => AutoArchiveDuration::ThreeDays,
         10080 => AutoArchiveDuration::Week,
-        _ => AutoArchiveDuration::Day,
+        other => return Err(format!("create_thread: 'auto_archive_minutes' must be one of 60/1440/4320/10080 (got {other}).").into()),
     };
     let thread = discord
         .create_thread(channel_id, name, kind)

@@ -9,9 +9,12 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 ///
 /// Returns a guard that must be kept alive so buffered file logs flush on exit.
 pub fn init() -> Option<WorkerGuard> {
-    let filter = || {
-        EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn,twilight_gateway=info"))
+    let filter = || match EnvFilter::try_from_default_env() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("warning: invalid RUST_LOG ({e}), using default 'info,sqlx=warn,twilight_gateway=info'");
+            EnvFilter::new("info,sqlx=warn,twilight_gateway=info")
+        }
     };
     let json = std::env::var("LOG_FORMAT")
         .map(|v| v.trim().eq_ignore_ascii_case("json"))
@@ -33,16 +36,23 @@ pub fn init() -> Option<WorkerGuard> {
 
     let (file_layer, guard) = match std::env::var("LOG_DIR") {
         Ok(dir) if !dir.trim().is_empty() => {
-            let appender = tracing_appender::rolling::daily(dir.trim(), "umbraix.log");
-            let (writer, guard) = tracing_appender::non_blocking(appender);
-            let layer = fmt::layer()
-                .json()
-                .with_current_span(true)
-                .with_writer(writer)
-                .with_ansi(false)
-                .with_filter(filter())
-                .boxed();
-            (Some(layer), Some(guard))
+            let dir = dir.trim().to_string();
+            // Validate early: fail loudly instead of silently losing file logs.
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                eprintln!("warning: LOG_DIR={dir} not writable ({e}), file logging disabled");
+                (None, None)
+            } else {
+                let appender = tracing_appender::rolling::daily(&dir, "umbraix.log");
+                let (writer, guard) = tracing_appender::non_blocking(appender);
+                let layer = fmt::layer()
+                    .json()
+                    .with_current_span(true)
+                    .with_writer(writer)
+                    .with_ansi(false)
+                    .with_filter(filter())
+                    .boxed();
+                (Some(layer), Some(guard))
+            }
         }
         _ => (None, None),
     };

@@ -31,7 +31,10 @@ pub fn slash_commands() -> Vec<Command> {
             };
             let mut b = CommandBuilder::new(spec.name, spec.summary, CommandType::ChatInput)
                 .contexts(contexts)
-                .integration_types([ApplicationIntegrationType::GuildInstall]);
+                .integration_types([
+                    ApplicationIntegrationType::GuildInstall,
+                    ApplicationIntegrationType::UserInstall,
+                ]);
             for arg in spec.slash_args {
                 let mut opt = StringBuilder::new(arg.name, arg.description).required(arg.required);
                 if !arg.choices.is_empty() {
@@ -52,10 +55,19 @@ pub async fn register_commands(ctx: &Context) {
     let cmds = slash_commands();
     let client = ctx.http.interaction(app_id);
     let res = match ctx.config.dev_guild_id {
-        Some(g) => client
-            .set_guild_commands(twilight_model::id::Id::new(g), &cmds)
-            .await
-            .map(|_| format!("guild {g}")),
+        Some(g) => match twilight_model::id::Id::new_checked(g) {
+            Some(gid) => client
+                .set_guild_commands(gid, &cmds)
+                .await
+                .map(|_| format!("guild {g}")),
+            None => {
+                tracing::warn!(
+                    guild = g,
+                    "DEV_GUILD_ID is zero/invalid, skipping slash registration"
+                );
+                return;
+            }
+        },
         None => client
             .set_global_commands(&cmds)
             .await
@@ -65,28 +77,33 @@ pub async fn register_commands(ctx: &Context) {
         Ok(scope) => tracing::info!(count = cmds.len(), scope, "Slash commands registered"),
         Err(e) => {
             ctx.commands_registered
-                .store(false, std::sync::atomic::Ordering::Relaxed);
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             tracing::error!(error = %e, "Failed to register slash commands");
         }
     }
 }
 
 fn joined_args(data: &CommandData, spec: &commands::CommandSpec) -> String {
-    spec.slash_args
-        .iter()
-        .filter_map(|arg| {
-            data.options
-                .iter()
-                .find(|o| o.name == arg.name)
-                .and_then(|o| match &o.value {
-                    CommandOptionValue::String(s) => Some(s.clone()),
-                    CommandOptionValue::Integer(i) => Some(i.to_string()),
-                    CommandOptionValue::Boolean(b) => Some(b.to_string()),
-                    _ => None,
-                })
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    // Preserve declared argument positions: omitted optionals become empty
+    // placeholders would shift positions, so join per-spec in order and skip
+    // empties only at the edges. Unhandled Discord types are logged, not
+    // silently dropped.
+    let mut parts = Vec::new();
+    for arg in spec.slash_args {
+        match data.options.iter().find(|o| o.name == arg.name) {
+            None => continue,
+            Some(o) => match &o.value {
+                CommandOptionValue::String(s) => parts.push(s.clone()),
+                CommandOptionValue::Integer(i) => parts.push(i.to_string()),
+                CommandOptionValue::Boolean(b) => parts.push(b.to_string()),
+                CommandOptionValue::Number(n) => parts.push(n.to_string()),
+                other => {
+                    tracing::debug!(option = %arg.name, ?other, "Unhandled slash option type, skipping");
+                }
+            },
+        }
+    }
+    parts.join(" ")
 }
 
 fn find_text_input(components: &[ModalInteractionComponent], custom_id: &str) -> Option<String> {
@@ -114,6 +131,7 @@ fn modal_value(data: &ModalInteractionData, custom_id: &str) -> Option<String> {
 
 pub async fn handle(ctx: &Context, interaction: Interaction) {
     let Some(author) = interaction.author().cloned() else {
+        tracing::debug!(interaction_id = %interaction.id, "Interaction without author, ignoring");
         return;
     };
     let responder = Responder::interaction(
@@ -165,6 +183,8 @@ pub async fn handle(ctx: &Context, interaction: Interaction) {
                 if let Err(e) = byok::open_modal(ctx, &responder, scope).await {
                     responder.error(ctx, &e, None, &request_id).await;
                 }
+            } else {
+                tracing::debug!(custom_id = %data.custom_id, "Unknown component custom_id");
             }
         }
         Some(InteractionData::ModalSubmit(data)) => {
@@ -173,10 +193,23 @@ pub async fn handle(ctx: &Context, interaction: Interaction) {
                 .strip_prefix(byok::MODAL_PREFIX)
                 .and_then(byok::parse_scope)
             else {
+                tracing::debug!(custom_id = %data.custom_id, "Unknown modal custom_id");
+                responder
+                    .info(
+                        ctx,
+                        Tone::Warn,
+                        "Unknown form",
+                        "This form is outdated. Run the command again.",
+                        true,
+                    )
+                    .await;
                 return;
             };
             tracing::info!(rid = %request_id, user = %author.id, ?scope, "BYOK modal submitted");
-            match modal_value(&data, byok::KEY_INPUT_ID) {
+            match modal_value(&data, byok::KEY_INPUT_ID)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
                 Some(key) => byok::submit_from_modal(ctx, &responder, author.id, scope, &key).await,
                 None => {
                     responder
@@ -191,7 +224,9 @@ pub async fn handle(ctx: &Context, interaction: Interaction) {
                 }
             }
         }
-        _ => {}
+        _ => {
+            tracing::debug!("Unhandled interaction data type");
+        }
     }
 }
 

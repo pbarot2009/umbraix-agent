@@ -55,17 +55,72 @@ fn required(name: &str) -> Result<String, BoxError> {
 }
 
 fn parsed<T: FromStr>(name: &str, default: T) -> T {
-    env::var(name)
-        .ok()
-        .and_then(|v| v.trim().parse::<T>().ok())
-        .unwrap_or(default)
+    match env::var(name) {
+        Ok(v) => {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                return default;
+            }
+            match trimmed.parse::<T>() {
+                Ok(val) => val,
+                Err(_) => {
+                    tracing::warn!(
+                        env_var = name,
+                        value = %trimmed,
+                        "invalid value, falling back to default"
+                    );
+                    default
+                }
+            }
+        }
+        Err(_) => default,
+    }
+}
+
+fn parse_bool(name: &str, default: bool) -> bool {
+    match env::var(name) {
+        Ok(v) => {
+            let t = v.trim().to_ascii_lowercase();
+            match t.as_str() {
+                "1" | "true" | "yes" | "y" | "on" => true,
+                "0" | "false" | "no" | "n" | "off" => false,
+                "" => default,
+                _ => {
+                    tracing::warn!(
+                        env_var = name,
+                        value = %v.trim(),
+                        "invalid bool, expected true/false/1/0/yes/no/on/off; falling back to default"
+                    );
+                    default
+                }
+            }
+        }
+        Err(_) => default,
+    }
 }
 
 fn optional_id(name: &str) -> Option<u64> {
-    env::var(name)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|v| *v != 0)
+    match env::var(name) {
+        Ok(v) => {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            match trimmed.parse::<u64>() {
+                Ok(id) if id != 0 => Some(id),
+                Ok(_) => None,
+                Err(_) => {
+                    tracing::warn!(
+                        env_var = name,
+                        value = %trimmed,
+                        "invalid snowflake ID, ignoring"
+                    );
+                    None
+                }
+            }
+        }
+        Err(_) => None,
+    }
 }
 
 fn non_empty_or(name: &str, default: &str) -> String {
@@ -106,7 +161,14 @@ impl Config {
             command_prefix,
             gemini_model: non_empty_or("GEMINI_MODEL", "gemini-flash-lite-latest"),
             max_iterations: parsed("MAX_ITERATIONS", 25usize).clamp(1, 256),
-            temperature: parsed("AGENT_TEMPERATURE", 0.2f32).clamp(0.0, 2.0),
+            temperature: {
+                let t: f32 = parsed("AGENT_TEMPERATURE", 0.2f32);
+                if t.is_finite() {
+                    t.clamp(0.0, 2.0)
+                } else {
+                    0.2
+                }
+            },
             history_limit: parsed("HISTORY_LIMIT", 20usize).clamp(0, 100),
             rate_limit_secs: parsed("RATE_LIMIT_SECS", 3u64).clamp(1, 3600),
             turn_timeout_secs: parsed("TURN_TIMEOUT_SECS", 600u64).clamp(30, 1800),
@@ -120,7 +182,7 @@ impl Config {
             allow_agent_role_name: non_empty_or("ALLOW_AGENT_ROLE_NAME", "allow_agent"),
             byok_session_secs: parsed("BYOK_SESSION_SECS", 300u64).clamp(60, 1800),
             error_log_channel_id: optional_id("ERROR_LOG_CHANNEL_ID"),
-            register_slash_commands: parsed("REGISTER_SLASH_COMMANDS", true),
+            register_slash_commands: parse_bool("REGISTER_SLASH_COMMANDS", true),
             dev_guild_id: optional_id("DEV_GUILD_ID"),
         })
     }
@@ -153,7 +215,17 @@ mod tests {
         "TURN_TIMEOUT_SECS",
         "MAX_TOOL_OUTPUT_CHARS",
         "MAX_CONCURRENT_TURNS",
+        "MAX_CONCURRENT_PER_KEY",
+        "QUEUE_TIMEOUT_SECS",
+        "GEMINI_MAX_RETRIES",
+        "GEMINI_REQUEST_TIMEOUT_SECS",
+        "ALLOW_AGENT_ROLE_NAME",
+        "BYOK_SESSION_SECS",
+        "ERROR_LOG_CHANNEL_ID",
+        "REGISTER_SLASH_COMMANDS",
+        "DEV_GUILD_ID",
         "COMMAND_PREFIX",
+        "DATABASE_URL",
     ];
 
     fn with_env(extra: &[(&str, &str)], f: impl FnOnce()) {

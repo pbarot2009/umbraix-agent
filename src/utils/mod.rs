@@ -56,10 +56,6 @@ pub fn looks_like_google_key(token: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-fn is_key_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '-' || c == '_'
-}
-
 /// Substring scan: finds `AIza` + 35 key chars ANYWHERE in the text.
 ///
 /// The old version only split on whitespace, so `key=AIza...`, `"AIza..."`,
@@ -75,17 +71,32 @@ fn find_google_key(text: &str) -> Option<(usize, usize)> {
     while i + 39 <= bytes.len() {
         if &bytes[i..i + 4] == b"AIza" {
             let end = i + 39;
-            if text[i..end].chars().all(is_key_char) {
+            // Byte-level boundary + charset check: avoids O(n^2) char walks
+            // and stays panic-free on multibyte text by verifying the slice
+            // is a valid char boundary before indexing as &str.
+            if text.is_char_boundary(i)
+                && text.is_char_boundary(end)
+                && text.get(i..end).is_some_and(|s| {
+                    s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                })
+            {
                 // Require a non-key-char (or string edge) on both sides so we
                 // don't match a 50-char token that merely contains AIza.
-                let before_ok = i == 0
-                    || !text[..i]
-                        .chars()
-                        .next_back()
-                        .map(is_key_char)
-                        .unwrap_or(false);
-                let after_ok = end == text.len()
-                    || !text[end..].chars().next().map(is_key_char).unwrap_or(false);
+                let before_ok = if i == 0 {
+                    true
+                } else {
+                    // Previous byte: ASCII key chars are single-byte, so a
+                    // multibyte char boundary implies non-key-char safely.
+                    !bytes[i - 1].is_ascii_alphanumeric()
+                        && bytes[i - 1] != b'-'
+                        && bytes[i - 1] != b'_'
+                };
+                let after_ok = if end == bytes.len() {
+                    true
+                } else {
+                    !bytes[end].is_ascii_alphanumeric() && bytes[end] != b'-' && bytes[end] != b'_'
+                };
                 if before_ok && after_ok {
                     return Some((i, end));
                 }

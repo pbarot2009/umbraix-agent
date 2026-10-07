@@ -115,12 +115,14 @@ pub struct Store {
 }
 
 // Snowflakes fit in i64 until the year 2084; store them as INTEGER.
+// Corrupt negative rows map to 0 (invalid, filtered by callers) rather than
+// wrapping into huge u64s.
 fn sid(id: u64) -> i64 {
-    id as i64
+    i64::try_from(id).unwrap_or(i64::MAX)
 }
 
 fn uid(v: i64) -> u64 {
-    v as u64
+    u64::try_from(v).unwrap_or(0)
 }
 
 impl Store {
@@ -133,7 +135,7 @@ impl Store {
             if path != ":memory:" && !path.is_empty() {
                 if let Some(parent) = std::path::Path::new(path).parent() {
                     if !parent.as_os_str().is_empty() {
-                        std::fs::create_dir_all(parent).map_err(|e| {
+                        tokio::fs::create_dir_all(parent).await.map_err(|e| {
                             StoreError::Setup(format!("cannot create {}: {e}", parent.display()))
                         })?;
                     }
@@ -295,11 +297,20 @@ impl Store {
                 id,
             ),
         };
+        let now = now_secs();
         sqlx::query(sql)
-            .bind(now_secs())
+            .bind(now)
             .bind(sid(id))
             .execute(&self.pool)
             .await?;
+        // Keep the cache coherent: refresh last_used_at or drop the entry.
+        if let Some(mut cached) = self.keys.get_mut(&owner) {
+            if let Some(stored) = cached.as_mut() {
+                let mut updated = (**stored).clone();
+                updated.last_used_at = Some(now);
+                *cached = Some(Arc::new(updated));
+            }
+        }
         Ok(())
     }
 
@@ -338,7 +349,29 @@ impl Store {
         guild_id: u64,
         f: impl FnOnce(&mut GuildConfig),
     ) -> Result<GuildConfig, StoreError> {
-        let mut cfg = self.guild_config(guild_id).await?;
+        // Read-modify-write inside an IMMEDIATE transaction so concurrent
+        // admin changes to different fields can't clobber each other.
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT enabled, allow_user_byok, model, cooldown_secs, log_channel_id, allow_role_id
+             FROM guild_config WHERE guild_id = ?1",
+        )
+        .bind(sid(guild_id))
+        .fetch_optional(&mut *tx)
+        .await?;
+        let mut cfg = match row {
+            None => GuildConfig::default(),
+            Some(r) => GuildConfig {
+                enabled: r.try_get::<i64, _>("enabled")? != 0,
+                allow_user_byok: r.try_get::<i64, _>("allow_user_byok")? != 0,
+                model: r.try_get("model")?,
+                cooldown_secs: r
+                    .try_get::<Option<i64>, _>("cooldown_secs")?
+                    .map(|v| v.max(0) as u64),
+                log_channel_id: r.try_get::<Option<i64>, _>("log_channel_id")?.map(uid),
+                allow_role_id: r.try_get::<Option<i64>, _>("allow_role_id")?.map(uid),
+            },
+        };
         f(&mut cfg);
         sqlx::query(
             "INSERT INTO guild_config (guild_id, enabled, allow_user_byok, model, cooldown_secs, log_channel_id, allow_role_id, updated_at)
@@ -356,13 +389,15 @@ impl Store {
         .bind(cfg.log_channel_id.map(sid))
         .bind(cfg.allow_role_id.map(sid))
         .bind(now_secs())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         self.configs.insert(guild_id, cfg.clone());
         Ok(cfg)
     }
 
     /// Remove everything stored for a guild (bot was removed from it).
+    /// Deletes keys, config, usage and audit rows so no guild data lingers.
     pub async fn purge_guild(&self, guild_id: u64) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM guild_keys WHERE guild_id = ?1")
@@ -370,6 +405,14 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM guild_config WHERE guild_id = ?1")
+            .bind(sid(guild_id))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM usage_daily WHERE subject_kind = 'guild' AND subject_id = ?1")
+            .bind(sid(guild_id))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM audit_log WHERE guild_id = ?1")
             .bind(sid(guild_id))
             .execute(&mut *tx)
             .await?;
@@ -426,6 +469,9 @@ impl Store {
     }
 
     pub async fn audit(&self, e: AuditEntry) -> Result<(), StoreError> {
+        // Scrub defence-in-depth: callers should already scrub, but audit rows
+        // persist — never store a raw key.
+        let (detail, _) = crate::utils::scrub_google_keys(&e.detail);
         sqlx::query(
             "INSERT INTO audit_log (ts, guild_id, user_id, key_source, action, detail, success)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -435,7 +481,7 @@ impl Store {
         .bind(sid(e.user_id))
         .bind(e.key_source)
         .bind(e.action)
-        .bind(crate::utils::truncate_chars(&e.detail, 2000))
+        .bind(crate::utils::truncate_chars(&detail, 2000))
         .bind(e.success as i64)
         .execute(&self.pool)
         .await?;
@@ -459,8 +505,16 @@ impl Store {
 }
 
 fn redact_url(url: &str) -> String {
-    match url.find('@') {
-        Some(at) => format!("***{}", &url[at..]),
+    // Hide the entire userinfo (password may itself contain '@').
+    match url.rfind('@') {
+        Some(at) => {
+            // Keep only scheme://***@rest for debuggability.
+            if let Some(scheme_end) = url.find("://") {
+                format!("{}://***{}", &url[..scheme_end], &url[at..])
+            } else {
+                format!("***{}", &url[at..])
+            }
+        }
         None => url.to_string(),
     }
 }

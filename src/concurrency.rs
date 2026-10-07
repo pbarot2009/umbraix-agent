@@ -17,19 +17,23 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 pub struct TurnLimiter {
     global: Arc<Semaphore>,
     capacity: usize,
-    active_users: Arc<DashMap<u64, ()>>,
+    active_users: Arc<DashMap<u64, u64>>,
     queue_timeout: Duration,
     queued: AtomicUsize,
+    slot_counter: AtomicU64,
 }
 
 pub struct UserSlot {
-    users: Arc<DashMap<u64, ()>>,
+    users: Arc<DashMap<u64, u64>>,
     user_id: u64,
+    token: u64,
 }
 
 impl Drop for UserSlot {
     fn drop(&mut self) {
-        self.users.remove(&self.user_id);
+        // Only remove if our token still owns the entry — avoids deleting a
+        // newer turn for the same user that claimed the slot after us.
+        self.users.remove_if(&self.user_id, |_, v| *v == self.token);
     }
 }
 
@@ -41,11 +45,12 @@ pub enum Admission {
 impl TurnLimiter {
     pub fn new(capacity: usize, queue_timeout: Duration) -> Self {
         Self {
-            global: Arc::new(Semaphore::new(capacity)),
-            capacity,
+            global: Arc::new(Semaphore::new(capacity.max(1))),
+            capacity: capacity.max(1),
             active_users: Arc::new(DashMap::new()),
             queue_timeout,
             queued: AtomicUsize::new(0),
+            slot_counter: AtomicU64::new(1),
         }
     }
 
@@ -54,10 +59,12 @@ impl TurnLimiter {
         match self.active_users.entry(user_id) {
             Entry::Occupied(_) => None,
             Entry::Vacant(v) => {
-                v.insert(());
+                let token = self.slot_counter.fetch_add(1, Ordering::Relaxed);
+                v.insert(token);
                 Some(UserSlot {
                     users: self.active_users.clone(),
                     user_id,
+                    token,
                 })
             }
         }
@@ -73,14 +80,23 @@ impl TurnLimiter {
     /// Wait in line for a slot. `None` on timeout or shutdown.
     pub async fn wait_admit(&self) -> Option<OwnedSemaphorePermit> {
         self.queued.fetch_add(1, Ordering::Relaxed);
+        // Guard ensures the queued counter is decremented exactly once,
+        // even if the future is cancelled while awaiting the semaphore.
+        struct QueuedGuard<'a>(&'a AtomicUsize);
+        impl Drop for QueuedGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let _guard = QueuedGuard(&self.queued);
         let res =
             tokio::time::timeout(self.queue_timeout, self.global.clone().acquire_owned()).await;
-        self.queued.fetch_sub(1, Ordering::Relaxed);
         res.ok().and_then(|r| r.ok())
     }
 
     pub fn active(&self) -> usize {
-        self.capacity - self.global.available_permits()
+        self.capacity
+            .saturating_sub(self.global.available_permits())
     }
 
     pub fn queued(&self) -> usize {
@@ -92,6 +108,8 @@ impl TurnLimiter {
     }
 
     /// Wait for in-flight turns to finish (graceful shutdown).
+    /// One-shot: after a successful drain the limiter is closed and can no
+    /// longer admit turns. Returns `false` on timeout or if already closed.
     pub async fn drain(&self, timeout: Duration) -> bool {
         let all = self.capacity as u32;
         let res = tokio::time::timeout(timeout, self.global.acquire_many(all)).await;
@@ -126,6 +144,26 @@ impl Metrics {
 
     pub fn get(counter: &AtomicU64) -> u64 {
         counter.load(Ordering::Relaxed)
+    }
+
+    /// Idiomatic instance helpers (preferred for new code).
+    pub fn inc_turns_started(&self) {
+        Self::inc(&self.turns_started);
+    }
+    pub fn inc_turns_ok(&self) {
+        Self::inc(&self.turns_ok);
+    }
+    pub fn inc_turns_failed(&self) {
+        Self::inc(&self.turns_failed);
+    }
+    pub fn inc_tool_calls(&self) {
+        Self::inc(&self.tool_calls);
+    }
+    pub fn inc_tool_denied(&self) {
+        Self::inc(&self.tool_denied);
+    }
+    pub fn inc_commands(&self) {
+        Self::inc(&self.commands);
     }
 }
 

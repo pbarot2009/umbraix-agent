@@ -1,7 +1,4 @@
-use std::{
-    sync::atomic::Ordering,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 use twilight_gateway::{
     create_recommended, CloseFrame, Config as ShardConfig, Event, EventTypeFlags, Intents, Shard,
     ShardId, StreamExt,
@@ -69,14 +66,14 @@ pub async fn run(ctx: Context) -> Result<(), BoxError> {
         _ = async { while tasks.join_next().await.is_some() {} } => true,
     };
     if all_stopped {
-        ctx.shutting_down.store(true, Ordering::Relaxed);
+        ctx.set_shutting_down();
         ctx.store.close().await;
         return Err(
             "All gateway shards stopped (fatal close from Discord — see the error above).".into(),
         );
     }
     tracing::info!("Shutdown requested — closing shards and draining in-flight requests");
-    ctx.shutting_down.store(true, Ordering::Relaxed);
+    ctx.set_shutting_down();
     for s in &senders {
         let _ = s.close(CloseFrame::NORMAL);
     }
@@ -102,15 +99,27 @@ pub async fn run(ctx: Context) -> Result<(), BoxError> {
 async fn runner(mut shard: Shard, ctx: Context) {
     let id = shard.id().number();
     let mut last_latency = Instant::now();
+    // Bound concurrent event tasks: message floods must queue, not OOM.
+    let event_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(256));
     while let Some(item) = shard.next_event(event_flags()).await {
         let event = match item {
             Ok(Event::GatewayClose(_)) if ctx.is_shutting_down() => break,
             Ok(Event::GatewayClose(frame)) => {
                 match frame.as_ref().and_then(|f| fatal_close_hint(f.code)) {
-                    Some(hint) => tracing::error!(shard = id, ?frame, hint, "Fatal gateway close"),
-                    None => tracing::warn!(shard = id, ?frame, "Gateway closed; reconnecting"),
+                    Some(hint) => {
+                        tracing::error!(
+                            shard = id,
+                            ?frame,
+                            hint,
+                            "Fatal gateway close, stopping shard"
+                        );
+                        break;
+                    }
+                    None => {
+                        tracing::warn!(shard = id, ?frame, "Gateway closed; reconnecting");
+                        continue;
+                    }
                 }
-                continue;
             }
             Ok(e) => e,
             Err(err) => {
@@ -122,11 +131,21 @@ async fn runner(mut shard: Shard, ctx: Context) {
         if last_latency.elapsed() > Duration::from_secs(30) {
             if let Some(avg) = shard.latency().average() {
                 ctx.shard_latency.insert(id, avg);
+            } else {
+                ctx.shard_latency.remove(&id);
             }
             last_latency = Instant::now();
         }
         let ctx = ctx.clone();
+        let sem = event_sem.clone();
+        // Backpressure: if 256 events are already in flight, shed load with
+        // a warning instead of spawning unbounded tasks.
+        let Ok(permit) = sem.try_acquire_owned() else {
+            tracing::warn!(shard = id, "Event queue full, shedding event");
+            continue;
+        };
         tokio::spawn(async move {
+            let _permit = permit;
             handle_event(event, ctx).await;
         });
     }
