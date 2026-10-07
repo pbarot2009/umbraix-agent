@@ -1,6 +1,9 @@
 use serde_json::{json, Value};
 
-use super::{channels, extra, info, manage_channels, manage_roles, messages, moderation, roles, server, threads, voice};
+use super::{
+    channels, extra, info, manage_channels, manage_roles, messages, moderation, roles, server,
+    threads, voice,
+};
 
 /// Tools declaration using Gemini's native function calling schema.
 ///
@@ -270,7 +273,11 @@ mod tests {
 
     #[test]
     fn catalog_has_full_coverage() {
-        assert!(tool_names().len() >= 60, "need 60+ tools, have {}", tool_names().len());
+        assert!(
+            tool_names().len() >= 60,
+            "need 60+ tools, have {}",
+            tool_names().len()
+        );
         for must in [
             "move_channel",
             "clone_channel",

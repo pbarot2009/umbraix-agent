@@ -13,7 +13,10 @@ fn parse_emoji_id(args: &Value, field: &str) -> Result<Id<EmojiMarker>, String> 
         if s.is_empty() {
             return Err(format!("Missing required field '{field}'."));
         }
-        return s.parse::<u64>().map(Id::new).map_err(|_| format!("Invalid emoji ID '{s}'."));
+        return s
+            .parse::<u64>()
+            .map(Id::new)
+            .map_err(|_| format!("Invalid emoji ID '{s}'."));
     }
     if let Some(n) = args[field].as_u64() {
         if n == 0 {
@@ -30,7 +33,10 @@ fn parse_webhook_id(args: &Value, field: &str) -> Result<Id<WebhookMarker>, Stri
         if s.is_empty() {
             return Err(format!("Missing required field '{field}'."));
         }
-        return s.parse::<u64>().map(Id::new).map_err(|_| format!("Invalid webhook ID '{s}'."));
+        return s
+            .parse::<u64>()
+            .map(Id::new)
+            .map_err(|_| format!("Invalid webhook ID '{s}'."));
     }
     if let Some(n) = args[field].as_u64() {
         if n == 0 {
@@ -47,7 +53,10 @@ fn parse_event_id(args: &Value, field: &str) -> Result<Id<ScheduledEventMarker>,
         if s.is_empty() {
             return Err(format!("Missing required field '{field}'."));
         }
-        return s.parse::<u64>().map(Id::new).map_err(|_| format!("Invalid event ID '{s}'."));
+        return s
+            .parse::<u64>()
+            .map(Id::new)
+            .map_err(|_| format!("Invalid event ID '{s}'."));
     }
     if let Some(n) = args[field].as_u64() {
         if n == 0 {
@@ -321,7 +330,9 @@ pub async fn edit_server(
     if args.get("afk_timeout").is_some() {
         let t = clamp_int_arg(args, "afk_timeout", 300, 60, 3600);
         if ![60, 300, 900, 1800, 3600].contains(&t) {
-            return Err("edit_server: 'afk_timeout' must be one of 60, 300, 900, 1800, 3600.".into());
+            return Err(
+                "edit_server: 'afk_timeout' must be one of 60, 300, 900, 1800, 3600.".into(),
+            );
         }
         req = req.afk_timeout(t);
         changed.push(format!("afk_timeout={t}s"));
@@ -381,12 +392,20 @@ pub async fn get_audit_logs(
     discord: &DiscordHttp,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let limit = clamp_int_arg(args, "limit", 20, 1, 100) as u16;
-    let log = discord.audit_log(guild_id).limit(limit).await?.model().await?;
+    let log = discord
+        .audit_log(guild_id)
+        .limit(limit)
+        .await?
+        .model()
+        .await?;
     if log.entries.is_empty() {
         return Ok("Audit log is empty.".to_string());
     }
-    let users: std::collections::HashMap<_, _> =
-        log.users.iter().map(|u| (u.id.get(), u.name.clone())).collect();
+    let users: std::collections::HashMap<_, _> = log
+        .users
+        .iter()
+        .map(|u| (u.id.get(), u.name.clone()))
+        .collect();
     let mut lines = Vec::new();
     for e in log.entries.iter().take(limit as usize) {
         let who = e
@@ -472,8 +491,14 @@ pub async fn list_invites(
     for i in invites.iter().take(50) {
         lines.push(fmt_invite(
             &i.code,
-            i.channel.as_ref().map(|c| format!("#{}", c.name.as_deref().unwrap_or("?"))).unwrap_or("(?)".to_string()),
-            i.inviter.as_ref().map(|u| u.name.clone()).unwrap_or("(?)".to_string()),
+            i.channel
+                .as_ref()
+                .map(|c| format!("#{}", c.name.as_deref().unwrap_or("?")))
+                .unwrap_or("(?)".to_string()),
+            i.inviter
+                .as_ref()
+                .map(|u| u.name.clone())
+                .unwrap_or("(?)".to_string()),
             format!("uses={:?}/{:?}", i.uses, i.max_uses),
         ));
     }
@@ -499,7 +524,10 @@ pub async fn list_channel_invites(
         lines.push(fmt_invite(
             &i.code,
             format!("<#{channel_id}>"),
-            i.inviter.as_ref().map(|u| u.name.clone()).unwrap_or("(?)".to_string()),
+            i.inviter
+                .as_ref()
+                .map(|u| u.name.clone())
+                .unwrap_or("(?)".to_string()),
             format!("uses={:?}/{:?}", i.uses, i.max_uses),
         ));
     }
@@ -518,7 +546,10 @@ pub async fn create_invite(
         parse_channel_id(args, "channel_id").map_err(|e| format!("create_invite: {e}"))?;
     let max_age = clamp_int_arg(args, "max_age", 86400, 0, 604800) as u32;
     let max_uses = clamp_int_arg(args, "max_uses", 0, 0, 100) as u16;
-    let temporary = args.get("temporary").and_then(|v| v.as_bool()).unwrap_or(false);
+    let temporary = args
+        .get("temporary")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let invite = discord
         .create_invite(channel_id)
         .max_age(max_age)
@@ -542,7 +573,10 @@ pub async fn delete_invite(
     if code.is_empty() {
         return Err("delete_invite: 'code' is required (the part after discord.gg/).".into());
     }
-    let code = code.trim().trim_start_matches("https://discord.gg/").trim_start_matches("discord.gg/");
+    let code = code
+        .trim()
+        .trim_start_matches("https://discord.gg/")
+        .trim_start_matches("discord.gg/");
     discord.delete_invite(code).await?;
     Ok(format!("Revoked invite discord.gg/{code}"))
 }
@@ -563,7 +597,10 @@ pub async fn list_webhooks(
             w.name.as_deref().unwrap_or("(no name)"),
             w.id,
             w.channel_id,
-            w.user.as_ref().map(|u| u.name.clone()).unwrap_or("(?)".to_string()),
+            w.user
+                .as_ref()
+                .map(|u| u.name.clone())
+                .unwrap_or("(?)".to_string()),
         ));
     }
     Ok(truncate_output(
@@ -583,7 +620,11 @@ pub async fn create_webhook(
     if name.is_empty() || name.len() > 80 {
         return Err("create_webhook: 'name' must be 1-80 characters.".into());
     }
-    let hook = discord.create_webhook(channel_id, name).await?.model().await?;
+    let hook = discord
+        .create_webhook(channel_id, name)
+        .await?
+        .model()
+        .await?;
     Ok(format!(
         "Created webhook '{}' (id={}) in <#{channel_id}>",
         hook.name.as_deref().unwrap_or(name),
@@ -607,7 +648,11 @@ pub async fn list_scheduled_events(
     guild_id: Id<GuildMarker>,
     discord: &DiscordHttp,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let events = discord.guild_scheduled_events(guild_id).await?.model().await?;
+    let events = discord
+        .guild_scheduled_events(guild_id)
+        .await?
+        .model()
+        .await?;
     if events.is_empty() {
         return Ok("No scheduled events.".to_string());
     }
@@ -631,7 +676,9 @@ pub async fn delete_scheduled_event(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let event_id =
         parse_event_id(args, "event_id").map_err(|e| format!("delete_scheduled_event: {e}"))?;
-    discord.delete_guild_scheduled_event(guild_id, event_id).await?;
+    discord
+        .delete_guild_scheduled_event(guild_id, event_id)
+        .await?;
     Ok(format!("Deleted scheduled event {event_id}"))
 }
 
@@ -640,7 +687,11 @@ pub async fn list_automod_rules(
     guild_id: Id<GuildMarker>,
     discord: &DiscordHttp,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let rules = discord.auto_moderation_rules(guild_id).await?.model().await?;
+    let rules = discord
+        .auto_moderation_rules(guild_id)
+        .await?
+        .model()
+        .await?;
     if rules.is_empty() {
         return Ok("No AutoMod rules.".to_string());
     }
@@ -663,7 +714,12 @@ pub async fn prune_preview(
     discord: &DiscordHttp,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let days = clamp_int_arg(args, "days", 7, 1, 30) as u16;
-    let count = discord.guild_prune_count(guild_id).days(days).await?.model().await?;
+    let count = discord
+        .guild_prune_count(guild_id)
+        .days(days)
+        .await?
+        .model()
+        .await?;
     Ok(format!(
         "Prune preview: {} members would be kicked for {days}d inactivity (use prune_members to execute).",
         count.pruned
@@ -678,7 +734,10 @@ pub async fn prune_members(
     use twilight_http::request::AuditLogReason;
     let days = clamp_int_arg(args, "days", 7, 1, 30) as u16;
     let reason = get_str(args, "reason", "");
-    let req = discord.create_guild_prune(guild_id).days(days).compute_prune_count(true);
+    let req = discord
+        .create_guild_prune(guild_id)
+        .days(days)
+        .compute_prune_count(true);
     let res = if reason.is_empty() {
         req.await?
     } else {

@@ -134,7 +134,9 @@ pub async fn edit_role(
         && args.get("hoist").is_none()
         && args.get("mentionable").is_none()
     {
-        return Err("edit_role: provide at least one of 'name', 'color', 'hoist', 'mentionable'.".into());
+        return Err(
+            "edit_role: provide at least one of 'name', 'color', 'hoist', 'mentionable'.".into(),
+        );
     }
     let mut req = discord.update_role(guild_id, role_id);
     if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
@@ -206,8 +208,7 @@ pub async fn set_role_position(
     guild_id: Id<GuildMarker>,
     discord: &DiscordHttp,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let role_id =
-        parse_role_id(args, "role_id").map_err(|e| format!("set_role_position: {e}"))?;
+    let role_id = parse_role_id(args, "role_id").map_err(|e| format!("set_role_position: {e}"))?;
     let position = clamp_int_arg(args, "position", 1, 1, 250);
     // Fetch current roles so the position update sends the full ordering Discord expects.
     let mut roles = discord.roles(guild_id).await?.model().await?;
@@ -219,7 +220,9 @@ pub async fn set_role_position(
         }
     }
     if !found {
-        return Err(format!("set_role_position: role {role_id} does not exist in this server.").into());
+        return Err(
+            format!("set_role_position: role {role_id} does not exist in this server.").into(),
+        );
     }
     roles.sort_by_key(|r| r.position);
     let positions: Vec<RolePosition> = roles
@@ -249,7 +252,10 @@ pub async fn list_role_members(
     }
     let mut lines = Vec::new();
     for (id, c) in entries.iter().take(50) {
-        let name = names.get(id).cloned().unwrap_or_else(|| "(unknown)".to_string());
+        let name = names
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| "(unknown)".to_string());
         lines.push(format!("- {name} id={id}: {c} members"));
     }
     Ok(truncate_output(

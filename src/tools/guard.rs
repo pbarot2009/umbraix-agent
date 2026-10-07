@@ -48,9 +48,7 @@ pub fn required_permission(tool: &str) -> Option<Permissions> {
         "edit_message" | "delete_single_message" => {
             Permissions::VIEW_CHANNEL | Permissions::MANAGE_MESSAGES
         }
-        "pin_message" | "unpin_message" => {
-            Permissions::VIEW_CHANNEL | Permissions::MANAGE_MESSAGES
-        }
+        "pin_message" | "unpin_message" => Permissions::VIEW_CHANNEL | Permissions::MANAGE_MESSAGES,
         "kick_member" => Permissions::KICK_MEMBERS,
         "ban_member" | "unban_user" => Permissions::BAN_MEMBERS,
         "timeout_member" | "remove_timeout" => Permissions::MODERATE_MEMBERS,
@@ -58,23 +56,38 @@ pub fn required_permission(tool: &str) -> Option<Permissions> {
         "set_nickname" => Permissions::MANAGE_NICKNAMES,
         "warn_member" => Permissions::MODERATE_MEMBERS,
         "prune_members" | "prune_preview" => Permissions::KICK_MEMBERS,
-        "create_channel" | "rename_channel" | "delete_channel" | "set_slowmode"
-        | "set_topic" | "move_channel" | "clone_channel" | "set_channel_nsfw"
-        | "set_voice_limits" | "lock_channel" | "unlock_channel" | "set_channel_permissions"
+        "create_channel"
+        | "rename_channel"
+        | "delete_channel"
+        | "set_slowmode"
+        | "set_topic"
+        | "move_channel"
+        | "clone_channel"
+        | "set_channel_nsfw"
+        | "set_voice_limits"
+        | "lock_channel"
+        | "unlock_channel"
+        | "set_channel_permissions"
         | "clear_channel_permissions" => Permissions::MANAGE_CHANNELS,
-        "create_role" | "assign_role" | "remove_role" | "delete_role" | "edit_role"
-        | "set_role_color" | "set_role_permissions" | "set_role_position" => {
-            Permissions::MANAGE_ROLES
-        }
+        "create_role"
+        | "assign_role"
+        | "remove_role"
+        | "delete_role"
+        | "edit_role"
+        | "set_role_color"
+        | "set_role_permissions"
+        | "set_role_position" => Permissions::MANAGE_ROLES,
         "list_role_members" | "role_info" => Permissions::MANAGE_ROLES,
         "move_voice_member" | "disconnect_voice_member" => Permissions::MOVE_MEMBERS,
         "mute_voice_member" | "unmute_voice_member" => Permissions::MUTE_MEMBERS,
         "deafen_voice_member" | "undeafen_voice_member" => Permissions::DEAFEN_MEMBERS,
         "get_voice_state" => Permissions::VIEW_CHANNEL,
-        "create_thread" | "thread_from_message" | "join_thread" | "archive_thread"
-        | "add_thread_member" | "remove_thread_member" => {
-            Permissions::VIEW_CHANNEL | Permissions::SEND_MESSAGES
-        }
+        "create_thread"
+        | "thread_from_message"
+        | "join_thread"
+        | "archive_thread"
+        | "add_thread_member"
+        | "remove_thread_member" => Permissions::VIEW_CHANNEL | Permissions::SEND_MESSAGES,
         "create_invite" | "delete_invite" => Permissions::CREATE_INVITE,
         "list_webhooks" | "create_webhook" | "delete_webhook" => Permissions::MANAGE_WEBHOOKS,
         "list_emojis" | "rename_emoji" | "delete_emoji" => Permissions::MANAGE_GUILD_EXPRESSIONS,
@@ -127,7 +140,10 @@ pub fn permission_label(p: Permissions) -> String {
         (Permissions::MANAGE_GUILD, "Manage Server"),
         (Permissions::MANAGE_CHANNELS, "Manage Channels"),
         (Permissions::MANAGE_ROLES, "Manage Roles"),
-        (Permissions::MANAGE_GUILD_EXPRESSIONS, "Manage Emojis/Stickers"),
+        (
+            Permissions::MANAGE_GUILD_EXPRESSIONS,
+            "Manage Emojis/Stickers",
+        ),
         (Permissions::MANAGE_WEBHOOKS, "Manage Webhooks"),
         (Permissions::MANAGE_EVENTS, "Manage Events"),
         (Permissions::CREATE_EVENTS, "Create Events"),
@@ -145,7 +161,10 @@ pub fn permission_label(p: Permissions) -> String {
         (Permissions::VIEW_AUDIT_LOG, "View Audit Log"),
         (Permissions::VIEW_CHANNEL, "View Channel"),
         (Permissions::SEND_MESSAGES, "Send Messages"),
-        (Permissions::SEND_MESSAGES_IN_THREADS, "Send Messages in Threads"),
+        (
+            Permissions::SEND_MESSAGES_IN_THREADS,
+            "Send Messages in Threads",
+        ),
         (Permissions::READ_MESSAGE_HISTORY, "Read Message History"),
         (Permissions::ADD_REACTIONS, "Add Reactions"),
         (Permissions::USE_EXTERNAL_EMOJIS, "Use External Emojis"),

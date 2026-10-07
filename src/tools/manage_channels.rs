@@ -185,7 +185,13 @@ pub async fn move_channel(
         match parse_optional_category(args) {
             Ok(parent) => {
                 req = req.parent_id(parent);
-                desc.push(format!("category={}", parent.map(|p| p.to_string()).as_deref().unwrap_or("(top level)")));
+                desc.push(format!(
+                    "category={}",
+                    parent
+                        .map(|p| p.to_string())
+                        .as_deref()
+                        .unwrap_or("(top level)")
+                ));
             }
             Err(s) if s == "__CLEAR__" => {
                 req = req.parent_id(None);
@@ -200,7 +206,10 @@ pub async fn move_channel(
         desc.push(format!("position={pos}"));
     }
     req.await?;
-    Ok(format!("Moved channel <#{channel_id}> ({})", desc.join(", ")))
+    Ok(format!(
+        "Moved channel <#{channel_id}> ({})",
+        desc.join(", ")
+    ))
 }
 
 pub async fn clone_channel(
@@ -327,7 +336,9 @@ pub async fn lock_channel(
     } else {
         req.reason(reason).await?;
     }
-    Ok(format!("Locked <#{channel_id}> (@everyone can no longer send messages)"))
+    Ok(format!(
+        "Locked <#{channel_id}> (@everyone can no longer send messages)"
+    ))
 }
 
 pub async fn unlock_channel(
@@ -341,10 +352,14 @@ pub async fn unlock_channel(
         .delete_channel_permission(channel_id)
         .role(guild_id.cast())
         .await?;
-    Ok(format!("Unlocked <#{channel_id}> (@everyone overwrite removed)"))
+    Ok(format!(
+        "Unlocked <#{channel_id}> (@everyone overwrite removed)"
+    ))
 }
 
-fn parse_overwrite_target(args: &Value) -> Result<(Id<GenericMarker>, PermissionOverwriteType), String> {
+fn parse_overwrite_target(
+    args: &Value,
+) -> Result<(Id<GenericMarker>, PermissionOverwriteType), String> {
     let kind_str = get_str(args, "target_type", "").to_lowercase();
     let kind = match kind_str.as_str() {
         "role" => PermissionOverwriteType::Role,
@@ -371,14 +386,16 @@ pub async fn set_channel_permissions(
     discord: &DiscordHttp,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use twilight_http::request::AuditLogReason;
-    let channel_id =
-        parse_channel_id(args, "channel_id").map_err(|e| format!("set_channel_permissions: {e}"))?;
+    let channel_id = parse_channel_id(args, "channel_id")
+        .map_err(|e| format!("set_channel_permissions: {e}"))?;
     let (target, kind) =
         parse_overwrite_target(args).map_err(|e| format!("set_channel_permissions: {e}"))?;
     let allow_bits = args.get("allow").and_then(|v| v.as_u64()).unwrap_or(0);
     let deny_bits = args.get("deny").and_then(|v| v.as_u64()).unwrap_or(0);
     if allow_bits == 0 && deny_bits == 0 {
-        return Err("set_channel_permissions: provide nonzero 'allow' and/or 'deny' bit integers.".into());
+        return Err(
+            "set_channel_permissions: provide nonzero 'allow' and/or 'deny' bit integers.".into(),
+        );
     }
     let overwrite = PermissionOverwrite {
         allow: Permissions::from_bits(allow_bits).map(Some).unwrap_or(None),
@@ -412,20 +429,25 @@ pub async fn clear_channel_permissions(
     let channel_id = parse_channel_id(args, "channel_id")
         .map_err(|e| format!("clear_channel_permissions: {e}"))?;
     let kind_str = get_str(args, "target_type", "").to_lowercase();
-    let probe = serde_json::json!({ "target_id": args.get("target_id").cloned().unwrap_or(Value::Null) });
+    let probe =
+        serde_json::json!({ "target_id": args.get("target_id").cloned().unwrap_or(Value::Null) });
     let req = discord.delete_channel_permission(channel_id);
     match kind_str.as_str() {
         "role" => {
-            let role_id =
-                parse_role_id(&probe, "target_id").map_err(|e| format!("clear_channel_permissions: {e}"))?;
+            let role_id = parse_role_id(&probe, "target_id")
+                .map_err(|e| format!("clear_channel_permissions: {e}"))?;
             req.role(role_id).await?;
         }
         "member" => {
-            let user_id =
-                parse_user_id(&probe, "target_id").map_err(|e| format!("clear_channel_permissions: {e}"))?;
+            let user_id = parse_user_id(&probe, "target_id")
+                .map_err(|e| format!("clear_channel_permissions: {e}"))?;
             req.member(user_id).await?;
         }
-        _ => return Err("clear_channel_permissions: 'target_type' must be 'role' or 'member'.".into()),
+        _ => {
+            return Err(
+                "clear_channel_permissions: 'target_type' must be 'role' or 'member'.".into(),
+            )
+        }
     }
     Ok(format!("Cleared overwrite in <#{channel_id}>"))
 }

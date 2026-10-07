@@ -147,7 +147,12 @@ pub async fn list_members(
     discord: &DiscordHttp,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let limit = clamp_int_arg(args, "limit", 25, 1, 100) as u16;
-    let members = discord.guild_members(guild_id).limit(limit).await?.model().await?;
+    let members = discord
+        .guild_members(guild_id)
+        .limit(limit)
+        .await?
+        .model()
+        .await?;
     if members.is_empty() {
         return Ok("No members visible.".to_string());
     }
@@ -180,7 +185,9 @@ pub async fn move_voice_member(
         .update_guild_member(guild_id, user_id)
         .channel_id(Some(channel_id))
         .await?;
-    Ok(format!("Moved <@{user_id}> to voice channel <#{channel_id}>"))
+    Ok(format!(
+        "Moved <@{user_id}> to voice channel <#{channel_id}>"
+    ))
 }
 
 pub async fn disconnect_voice_member(
@@ -262,7 +269,11 @@ pub async fn get_voice_state(
     discord: &DiscordHttp,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let user_id = parse_user_id(args, "user_id").map_err(|e| format!("get_voice_state: {e}"))?;
-    let state = discord.user_voice_state(guild_id, user_id).await?.model().await?;
+    let state = discord
+        .user_voice_state(guild_id, user_id)
+        .await?
+        .model()
+        .await?;
     Ok(format!(
         "Voice state for <@{user_id}>: channel={:?}, mute={} deaf={} self_mute={} self_deaf={} suppress={}",
         state.channel_id, state.mute, state.deaf, state.self_mute, state.self_deaf, state.suppress,
@@ -290,7 +301,11 @@ pub async fn warn_member(
         },
         Err(_) => format!("{user_id}"),
     };
-    let dm = discord.create_private_channel(user_id).await?.model().await?;
+    let dm = discord
+        .create_private_channel(user_id)
+        .await?
+        .model()
+        .await?;
     let text = format!("You received a warning in this server: {reason}");
     if let Err(e) = discord.create_message(dm.id).content(&text).await {
         let raw = e.to_string();

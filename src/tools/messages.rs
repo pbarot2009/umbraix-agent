@@ -271,8 +271,7 @@ pub async fn list_pins(
     _guild_id: Id<GuildMarker>,
     discord: &DiscordHttp,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let channel_id =
-        parse_channel_id(args, "channel_id").map_err(|e| format!("list_pins: {e}"))?;
+    let channel_id = parse_channel_id(args, "channel_id").map_err(|e| format!("list_pins: {e}"))?;
     let pins = discord.pins(channel_id).await?.model().await?;
     if pins.items.is_empty() {
         return Ok(format!("No pinned messages in <#{channel_id}>."));
@@ -290,7 +289,11 @@ pub async fn list_pins(
         ));
     }
     Ok(truncate_output(
-        format!("Pinned in <#{channel_id}> ({}):\n{}", pins.items.len(), lines.join("\n")),
+        format!(
+            "Pinned in <#{channel_id}> ({}):\n{}",
+            pins.items.len(),
+            lines.join("\n")
+        ),
         4000,
     ))
 }
@@ -305,5 +308,7 @@ pub async fn publish_message(
     let message_id =
         parse_message_id(args, "message_id").map_err(|e| format!("publish_message: {e}"))?;
     discord.crosspost_message(channel_id, message_id).await?;
-    Ok(format!("Published message {message_id} from <#{channel_id}> to following channels"))
+    Ok(format!(
+        "Published message {message_id} from <#{channel_id}> to following channels"
+    ))
 }

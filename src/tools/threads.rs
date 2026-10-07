@@ -149,7 +149,11 @@ pub async fn list_active_threads(
         ));
     }
     Ok(truncate_output(
-        format!("Active threads ({}):\n{}", res.threads.len(), lines.join("\n")),
+        format!(
+            "Active threads ({}):\n{}",
+            res.threads.len(),
+            lines.join("\n")
+        ),
         4000,
     ))
 }
@@ -197,7 +201,9 @@ pub async fn thread_from_message(
     let channel_id =
         parse_channel_id(args, "channel_id").map_err(|e| format!("thread_from_message: {e}"))?;
     let message_id = if let Some(s) = args["message_id"].as_str() {
-        s.trim().parse::<u64>().map_err(|_| "thread_from_message: invalid message_id.")?
+        s.trim()
+            .parse::<u64>()
+            .map_err(|_| "thread_from_message: invalid message_id.")?
     } else if let Some(n) = args["message_id"].as_u64() {
         n
     } else {
@@ -208,11 +214,7 @@ pub async fn thread_from_message(
         return Err("thread_from_message: 'name' must be 1-100 characters.".into());
     }
     let thread = discord
-        .create_thread_from_message(
-            channel_id,
-            twilight_model::id::Id::new(message_id),
-            name,
-        )
+        .create_thread_from_message(channel_id, twilight_model::id::Id::new(message_id), name)
         .await?
         .model()
         .await?;
@@ -270,10 +272,20 @@ pub async fn list_thread_members(
     let lines: Vec<String> = members
         .iter()
         .take(50)
-        .map(|m| format!("- user={:?} joined={}", m.user_id, m.join_timestamp.iso_8601()))
+        .map(|m| {
+            format!(
+                "- user={:?} joined={}",
+                m.user_id,
+                m.join_timestamp.iso_8601()
+            )
+        })
         .collect();
     Ok(truncate_output(
-        format!("Thread <#{channel_id}> members ({}):\n{}", members.len(), lines.join("\n")),
+        format!(
+            "Thread <#{channel_id}> members ({}):\n{}",
+            members.len(),
+            lines.join("\n")
+        ),
         4000,
     ))
 }
@@ -285,8 +297,7 @@ pub async fn add_thread_member(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let channel_id =
         parse_channel_id(args, "channel_id").map_err(|e| format!("add_thread_member: {e}"))?;
-    let user_id =
-        parse_user_id(args, "user_id").map_err(|e| format!("add_thread_member: {e}"))?;
+    let user_id = parse_user_id(args, "user_id").map_err(|e| format!("add_thread_member: {e}"))?;
     discord.add_thread_member(channel_id, user_id).await?;
     Ok(format!("Added <@{user_id}> to thread <#{channel_id}>"))
 }
