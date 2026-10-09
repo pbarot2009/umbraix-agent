@@ -30,6 +30,11 @@ pub async fn handle_event(event: Event, ctx: Context) {
             {
                 interactions::register_commands(&ctx).await;
             }
+            // A restart may have orphaned half-done turns: resume them once
+            // (re-grounded, attempt-capped) so users don't lose work to a
+            // network drop. Runs in the background; failures never block
+            // the gateway.
+            crate::agent::recovery::spawn_pending_recovery(&ctx);
         }
         Event::GuildCreate(g) => {
             tracing::debug!(guild = %g.id(), "Guild available");

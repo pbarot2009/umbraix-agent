@@ -95,6 +95,32 @@ pub struct AuditEntry {
     pub success: bool,
 }
 
+/// A half-finished agent turn persisted so a network drop / restart can
+/// resume it on the next boot instead of forgetting the user's work.
+///
+/// Lifecycle: `pending` (created at turn start) -> checkpointed after each
+/// tool batch -> `DELETE` on completion / terminal failure / expiry.
+/// Rows left behind by a crash stay `pending`/`running` and are claimed
+/// exactly once on boot (atomic `UPDATE ... WHERE status IN ...`), with an
+/// attempt counter + age TTL so a poison request can never infinite-loop.
+#[derive(Debug, Clone)]
+pub struct PendingTurn {
+    pub request_id: String,
+    pub guild_id: u64,
+    pub channel_id: u64,
+    pub user_id: u64,
+    pub user_name: String,
+    pub prompt: String,
+    pub history_json: String,
+    pub tool_summary: String,
+    pub status: String,
+    pub attempts: i64,
+    pub max_attempts: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StoreCounts {
     pub user_keys: i64,
@@ -416,6 +442,10 @@ impl Store {
             .bind(sid(guild_id))
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM pending_turns WHERE guild_id = ?1")
+            .bind(sid(guild_id))
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         self.keys.remove(&KeyOwner::Guild(guild_id));
         self.configs.remove(&guild_id);
@@ -501,6 +531,206 @@ impl Store {
             guild_keys: row.try_get("g")?,
             guild_configs: row.try_get("c")?,
         })
+    }
+
+    // ---------- Pending turns (crash-safe resume) ----------
+
+    /// Create (or replace) a pending-turn row at turn start. The prompt is
+    /// scrubbed + truncated by the caller; never persist raw API keys.
+    pub async fn create_pending_turn(&self, turn: &PendingTurn) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO pending_turns (request_id, guild_id, channel_id, user_id, user_name,
+              prompt, history_json, tool_summary, status, attempts, max_attempts,
+              created_at, updated_at, last_error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?10, ?11, ?11, ?12)
+             ON CONFLICT(request_id) DO UPDATE SET
+               guild_id = excluded.guild_id, channel_id = excluded.channel_id,
+               user_id = excluded.user_id, user_name = excluded.user_name,
+               prompt = excluded.prompt, history_json = excluded.history_json,
+               tool_summary = excluded.tool_summary, status = 'pending',
+               attempts = excluded.attempts, max_attempts = excluded.max_attempts,
+               updated_at = excluded.updated_at, last_error = excluded.last_error",
+        )
+        .bind(&turn.request_id)
+        .bind(sid(turn.guild_id))
+        .bind(sid(turn.channel_id))
+        .bind(sid(turn.user_id))
+        .bind(crate::utils::truncate_chars(&turn.user_name, 100))
+        .bind(crate::utils::truncate_chars(&turn.prompt, 4000))
+        .bind(&turn.history_json)
+        .bind(crate::utils::truncate_chars(&turn.tool_summary, 1000))
+        .bind(turn.attempts)
+        .bind(turn.max_attempts)
+        .bind(turn.created_at)
+        .bind(turn.last_error.as_deref())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Best-effort checkpoint after each tool batch: keeps the resume point
+    /// fresh without blocking the turn (callers `tokio::spawn` this or await
+    /// it directly — it is a single indexed UPDATE).
+    pub async fn checkpoint_pending(
+        &self,
+        request_id: &str,
+        history_json: &str,
+        tool_summary: &str,
+    ) -> Result<(), StoreError> {
+        // Bound row size: history is already bounded upstream (last ~100
+        // entries), this is defence-in-depth so one huge dump can't bloat SQLite.
+        let hist = crate::utils::truncate_chars(history_json, 200_000);
+        sqlx::query(
+            "UPDATE pending_turns SET history_json = ?1, tool_summary = ?2, updated_at = ?3,
+              status = CASE WHEN status = 'pending' THEN 'pending' ELSE status END
+             WHERE request_id = ?4 AND status IN ('pending', 'running')",
+        )
+        .bind(hist)
+        .bind(crate::utils::truncate_chars(tool_summary, 1000))
+        .bind(now_secs())
+        .bind(request_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_pending(&self, request_id: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM pending_turns WHERE request_id = ?1")
+            .bind(request_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_pending_error(
+        &self,
+        request_id: &str,
+        last_error: &str,
+    ) -> Result<(), StoreError> {
+        let (scrubbed, _) = crate::utils::scrub_google_keys(last_error);
+        sqlx::query(
+            "UPDATE pending_turns SET last_error = ?1, updated_at = ?2 WHERE request_id = ?3",
+        )
+        .bind(crate::utils::truncate_chars(&scrubbed, 1000))
+        .bind(now_secs())
+        .bind(request_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    fn pending_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<PendingTurn, StoreError> {
+        Ok(PendingTurn {
+            request_id: row.try_get("request_id")?,
+            guild_id: uid(row.try_get::<i64, _>("guild_id")?),
+            channel_id: uid(row.try_get::<i64, _>("channel_id")?),
+            user_id: uid(row.try_get::<i64, _>("user_id")?),
+            user_name: row.try_get("user_name")?,
+            prompt: row.try_get("prompt")?,
+            history_json: row.try_get("history_json")?,
+            tool_summary: row.try_get("tool_summary")?,
+            status: row.try_get("status")?,
+            attempts: row.try_get("attempts")?,
+            max_attempts: row.try_get("max_attempts")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+            last_error: row.try_get("last_error")?,
+        })
+    }
+
+    /// Rows eligible for boot resume: still pending/running, under the
+    /// attempt budget and newer than `max_age_secs`.
+    pub async fn list_recoverable_turns(
+        &self,
+        max_age_secs: i64,
+        limit: i64,
+    ) -> Result<Vec<PendingTurn>, StoreError> {
+        let cutoff = now_secs() - max_age_secs.max(60);
+        let rows = sqlx::query(
+            "SELECT request_id, guild_id, channel_id, user_id, user_name, prompt,
+                    history_json, tool_summary, status, attempts, max_attempts,
+                    created_at, updated_at, last_error
+             FROM pending_turns
+             WHERE status IN ('pending', 'running') AND updated_at > ?1
+             ORDER BY updated_at ASC LIMIT ?2",
+        )
+        .bind(cutoff)
+        .bind(limit.clamp(1, 50))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::pending_from_row).collect()
+    }
+
+    /// Atomically claim one row for resume (prevents double-resume when
+    /// several shards boot at once). Returns `None` when already claimed,
+    /// over budget, or gone.
+    pub async fn claim_pending_turn(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<PendingTurn>, StoreError> {
+        let res = sqlx::query(
+            "UPDATE pending_turns SET status = 'running', attempts = attempts + 1, updated_at = ?1
+             WHERE request_id = ?2 AND status IN ('pending', 'running')",
+        )
+        .bind(now_secs())
+        .bind(request_id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "SELECT request_id, guild_id, channel_id, user_id, user_name, prompt,
+                    history_json, tool_summary, status, attempts, max_attempts,
+                    created_at, updated_at, last_error
+             FROM pending_turns WHERE request_id = ?1",
+        )
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| Self::pending_from_row(&r)).transpose()
+    }
+
+    /// Park a failed-but-retryable resume back to `pending` (with fresh
+    /// checkpoint) so the *next* boot can retry — without tight-looping in
+    /// this boot. Over-budget rows are deleted instead.
+    pub async fn park_pending_for_retry(
+        &self,
+        request_id: &str,
+        history_json: &str,
+        tool_summary: &str,
+        last_error: &str,
+    ) -> Result<(), StoreError> {
+        let (scrubbed, _) = crate::utils::scrub_google_keys(last_error);
+        let hist = crate::utils::truncate_chars(history_json, 200_000);
+        let res = sqlx::query(
+            "UPDATE pending_turns SET status = 'pending', history_json = ?1, tool_summary = ?2,
+              last_error = ?3, updated_at = ?4
+             WHERE request_id = ?5 AND attempts < max_attempts",
+        )
+        .bind(hist)
+        .bind(crate::utils::truncate_chars(tool_summary, 1000))
+        .bind(crate::utils::truncate_chars(&scrubbed, 1000))
+        .bind(now_secs())
+        .bind(request_id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            // Over budget (or gone): delete so it can never loop.
+            self.delete_pending(request_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Delete rows older than `max_age_secs` (stale crash leftovers).
+    /// Returns the number removed.
+    pub async fn prune_expired_pending(&self, max_age_secs: i64) -> Result<u64, StoreError> {
+        let cutoff = now_secs() - max_age_secs.max(60);
+        let res = sqlx::query("DELETE FROM pending_turns WHERE updated_at <= ?1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
     }
 }
 

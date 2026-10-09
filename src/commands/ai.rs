@@ -204,6 +204,32 @@ pub async fn run(ctx: &Context, inv: Invocation, args: String) {
         snapshot: snapshot.clone(),
         bot_id: ctx.bot_user_id.get().copied(),
     };
+    // Crash-safe resume: persist the turn BEFORE running it. If the process
+    // dies / network drops mid-turn, the row survives and boot recovery
+    // resumes it once (with server-state re-grounding). Deleted on
+    // completion / terminal failure so it can never loop.
+    let (scrubbed_pending_prompt, _) = crate::utils::scrub_google_keys(&prompt);
+    let pending = crate::storage::PendingTurn {
+        request_id: inv.request_id.clone(),
+        guild_id: guild_id.get(),
+        channel_id: channel_id.get(),
+        user_id: user,
+        user_name: inv.user_name.clone(),
+        prompt: scrubbed_pending_prompt,
+        history_json: "[]".to_string(),
+        tool_summary: String::new(),
+        status: "pending".to_string(),
+        attempts: 0,
+        max_attempts: ctx.config.resume_max_attempts,
+        created_at: crate::utils::now_secs(),
+        updated_at: crate::utils::now_secs(),
+        last_error: None,
+    };
+    if ctx.config.resume_enabled {
+        if let Err(e) = ctx.store.create_pending_turn(&pending).await {
+            tracing::debug!(error = %e, rid = %inv.request_id, "Failed to persist pending turn (best-effort)");
+        }
+    }
     let req = TurnRequest {
         guild_id,
         channel_id,
@@ -226,15 +252,30 @@ pub async fn run(ctx: &Context, inv: Invocation, args: String) {
     );
     Metrics::inc(&ctx.metrics.turns_started);
     let started = std::time::Instant::now();
-    let result = agent::run_agent_turn(ctx, &req, &grant, &guard, &inv.responder)
-        .instrument(span.clone())
-        .await;
+    let pending_id = ctx.config.resume_enabled.then(|| inv.request_id.clone());
+    let result = agent::run_agent_turn_resumable(
+        ctx,
+        &req,
+        &grant,
+        &guard,
+        &inv.responder,
+        pending_id.clone(),
+        None,
+    )
+    .instrument(span.clone())
+    .await;
     let ms = started.elapsed().as_millis() as u64;
 
     let (tool_calls, failed) = match &result {
         Ok(o) => {
             Metrics::inc(&ctx.metrics.turns_ok);
             tracing::info!(parent: &span, ms, steps = o.steps, tool_calls = o.tool_calls, tool_errors = o.tool_errors, "Turn completed");
+            // Done — remove the resume row so a later reboot can't replay it.
+            if let Some(pid) = pending_id.as_deref() {
+                if let Err(e) = ctx.store.delete_pending(pid).await {
+                    tracing::debug!(error = %e, request = pid, "Failed to delete pending turn after success");
+                }
+            }
             (o.tool_calls as i64, false)
         }
         Err(e) => {
@@ -243,6 +284,16 @@ pub async fn run(ctx: &Context, inv: Invocation, args: String) {
             inv.responder
                 .error(ctx, e, Some(grant.source), &inv.request_id)
                 .await;
+            // Keep retryable failures for boot resume; delete terminal ones.
+            if let Some(pid) = pending_id.as_deref() {
+                if agent::is_resumable_error(e) {
+                    if let Err(db) = ctx.store.mark_pending_error(pid, &e.to_string()).await {
+                        tracing::debug!(error = %db, request = pid, "Failed to mark pending turn error");
+                    }
+                } else if let Err(db) = ctx.store.delete_pending(pid).await {
+                    tracing::debug!(error = %db, request = pid, "Failed to delete terminal pending turn");
+                }
+            }
             (0, true)
         }
     };

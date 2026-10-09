@@ -29,6 +29,9 @@ pub struct Config {
     pub error_log_channel_id: Option<u64>,
     pub register_slash_commands: bool,
     pub dev_guild_id: Option<u64>,
+    pub resume_enabled: bool,
+    pub resume_max_age_secs: i64,
+    pub resume_max_attempts: i64,
 }
 
 impl std::fmt::Debug for Config {
@@ -184,6 +187,9 @@ impl Config {
             error_log_channel_id: optional_id("ERROR_LOG_CHANNEL_ID"),
             register_slash_commands: parse_bool("REGISTER_SLASH_COMMANDS", true),
             dev_guild_id: optional_id("DEV_GUILD_ID"),
+            resume_enabled: parse_bool("RESUME_ENABLED", true),
+            resume_max_age_secs: parsed("RESUME_MAX_AGE_SECS", 1800i64).clamp(300, 86_400),
+            resume_max_attempts: parsed("RESUME_MAX_ATTEMPTS", 2i64).clamp(1, 5),
         })
     }
 }

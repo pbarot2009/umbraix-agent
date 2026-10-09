@@ -54,6 +54,7 @@ pub struct Inner {
     pub bot_user_id: OnceLock<Id<UserMarker>>,
     pub commands_registered: AtomicBool,
     pub shutting_down: AtomicBool,
+    pub recovery_started: AtomicBool,
     pub started_at: Instant,
 }
 
@@ -99,6 +100,7 @@ impl Context {
                 bot_user_id: OnceLock::new(),
                 commands_registered: AtomicBool::new(false),
                 shutting_down: AtomicBool::new(false),
+                recovery_started: AtomicBool::new(false),
                 started_at: Instant::now(),
                 config,
             }),

@@ -42,6 +42,60 @@ pub struct TurnOutcome {
     pub tool_errors: usize,
 }
 
+/// Info for an automatic resume after a network drop / restart.
+///
+/// The model MUST re-ground with read-only `list_*` / `search_*` tools
+/// before acting, because the Discord server may have changed (or some
+/// actions may already have applied) while we were offline.
+#[derive(Debug, Clone, Default)]
+pub struct ResumeInfo {
+    pub attempt: u32,
+    pub original_request_id: String,
+    pub tool_summary: String,
+}
+
+impl ResumeInfo {
+    pub fn reminder_text(&self, user_name: &str) -> String {
+        let done = if self.tool_summary.trim().is_empty() {
+            "no tool actions were confirmed before the interruption".to_string()
+        } else {
+            format!(
+                "confirmed actions before interruption: {}",
+                self.tool_summary
+            )
+        };
+        format!(
+            "SYSTEM REMINDER — AUTOMATIC RESUME (attempt {} of interrupted request {} from {}). \
+             The previous attempt was cut off by a network disconnect / bot restart, NOT by user intent. \
+             {done}. \
+             Safety protocol: FIRST re-ground by calling the read-only list/search tools \
+             (list_channels, list_roles, search_members, get_messages as needed) to check the CURRENT server state. \
+             Do NOT repeat an action that already succeeded (e.g. do not re-create a channel/role that now exists — reuse it). \
+             Then complete ONLY the remaining work from the original request. \
+             Never claim unexecuted work succeeded. If everything is already done, say so and stop.",
+            self.attempt, self.original_request_id, user_name
+        )
+    }
+}
+
+/// Errors worth keeping a `pending_turns` row for (transient network /
+/// overload). Everything else (bad key, permissions, safety blocks,
+/// bad request, ...) is terminal: the pending row is deleted so a poison
+/// request can never infinite-loop across restarts.
+pub fn is_resumable_error(e: &BotError) -> bool {
+    matches!(
+        e.code(),
+        "GEMINI_NETWORK"
+            | "GEMINI_TIMEOUT"
+            | "GEMINI_UNAVAILABLE"
+            | "GEMINI_RATE_LIMIT"
+            | "TIMEOUT"
+            | "DISCORD_UNAVAILABLE"
+            | "DISCORD_RATE_LIMITED"
+            | "STORAGE"
+    )
+}
+
 /// Keeps the typing indicator alive for the whole turn; stops on drop.
 struct TypingGuard(tokio::task::JoinHandle<()>);
 
@@ -74,6 +128,21 @@ pub async fn run_agent_turn(
     guard: &ToolGuard,
     responder: &Responder,
 ) -> Result<TurnOutcome, BotError> {
+    run_agent_turn_resumable(ctx, req, grant, guard, responder, None, None).await
+}
+
+/// Resumable variant: checkpoints progress to `pending_turns` after every
+/// tool batch (crash-safe), and optionally injects a re-grounding reminder
+/// when this is an automatic resume after a disconnect / restart.
+pub async fn run_agent_turn_resumable(
+    ctx: &Context,
+    req: &TurnRequest,
+    grant: &Grant,
+    guard: &ToolGuard,
+    responder: &Responder,
+    pending_id: Option<String>,
+    resume: Option<ResumeInfo>,
+) -> Result<TurnOutcome, BotError> {
     use std::sync::{Arc, Mutex as StdMutex};
     let secs = ctx.config.turn_timeout_secs.max(30);
     // Shared partial-history buffer flushed on timeout.
@@ -81,7 +150,16 @@ pub async fn run_agent_turn(
     let partial_inner = partial.clone();
     let res = tokio::time::timeout(
         Duration::from_secs(secs),
-        run_inner(ctx, req, grant, guard, responder, Some(partial_inner)),
+        run_inner(
+            ctx,
+            req,
+            grant,
+            guard,
+            responder,
+            Some(partial_inner),
+            pending_id,
+            resume,
+        ),
     )
     .await;
     match res {
@@ -104,6 +182,8 @@ async fn run_inner(
     guard: &ToolGuard,
     responder: &Responder,
     partial: Option<std::sync::Arc<std::sync::Mutex<Vec<Value>>>>,
+    pending_id: Option<String>,
+    resume: Option<ResumeInfo>,
 ) -> Result<TurnOutcome, BotError> {
     let started = Instant::now();
     let mem_key = (req.channel_id.get(), req.user_id.get());
@@ -134,8 +214,19 @@ async fn run_inner(
 
     let mut contents = ctx.memory.history(mem_key).await;
     contents.push(user_turn.clone());
-    let turn_start = contents.len();
     let mut new_entries: Vec<Value> = vec![user_turn];
+    // Automatic resume: force re-grounding BEFORE any mutating tool call.
+    // The restored history already holds pre-interruption tool results, so
+    // the model can diff "what I did" vs "what the server shows now".
+    if let Some(r) = resume.as_ref() {
+        let reminder = json!({
+            "role": "user",
+            "parts": [{ "text": r.reminder_text(&req.user_name) }]
+        });
+        contents.push(reminder.clone());
+        new_entries.push(reminder);
+    }
+    let turn_start = contents.len();
     let flush_partial = |entries: &Vec<Value>| {
         if let Some(p) = &partial {
             if let Ok(mut g) = p.lock() {
@@ -403,6 +494,10 @@ async fn run_inner(
             new_entries.drain(..excess);
         }
         flush_partial(&new_entries);
+        // Crash-safe checkpoint: a network drop / restart after this point
+        // resumes from here instead of forgetting the half-done work.
+        // Best-effort: a DB hiccup must never fail the turn itself.
+        checkpoint_progress(ctx, pending_id.as_deref(), &new_entries, &tool_counts).await;
 
         // Bound the in-turn context. Drop whole (call, response) pairs right
         // after this turn's user prompt so pairs never get split. The window
@@ -707,6 +802,46 @@ async fn send_answer(
         responder.embed(ctx, embed, false).await?;
     }
     Ok(())
+}
+
+/// Persist the in-progress turn so a crash / network drop can resume it.
+/// Keeps only the tail (last 100 entries) so the row stays small; the
+/// caller already scrubbed keys out of `new_entries`.
+async fn checkpoint_progress(
+    ctx: &Context,
+    pending_id: Option<&str>,
+    new_entries: &[Value],
+    tool_counts: &HashMap<String, usize>,
+) {
+    let Some(pid) = pending_id else { return };
+    let tail_start = new_entries.len().saturating_sub(100);
+    let tail = &new_entries[tail_start..];
+    let Ok(history_json) = serde_json::to_string(tail) else {
+        return;
+    };
+    let mut parts: Vec<String> = tool_counts
+        .iter()
+        .map(|(k, v)| format!("{k}×{v}"))
+        .collect();
+    parts.sort();
+    let summary = parts.join(", ");
+    if let Err(e) = ctx
+        .store
+        .checkpoint_pending(pid, &history_json, &summary)
+        .await
+    {
+        tracing::debug!(request = pid, error = %e, "Pending-turn checkpoint failed (best-effort)");
+    }
+}
+
+/// Summarize tool counts for pending-row bookkeeping (`create_channel×2`).
+pub fn summarize_tool_counts(tool_counts: &HashMap<String, usize>) -> String {
+    let mut parts: Vec<String> = tool_counts
+        .iter()
+        .map(|(k, v)| format!("{k}×{v}"))
+        .collect();
+    parts.sort();
+    parts.join(", ")
 }
 
 pub fn split_message(text: &str, limit: usize) -> Vec<String> {
